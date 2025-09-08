@@ -23,7 +23,7 @@ pub trait Traceable: Send + Sync {
 
 impl<'a> Tracer<'a> {
     pub fn edge(&mut self, ptr: *const ()) {
-        let ptr_addr = ptr as usize;
+        let ptr_addr = ptr.expose_provenance();
         if let Some(edges) = &mut self.edges {
             edges.push(ptr_addr);
         }
@@ -59,7 +59,7 @@ impl<T> AutoPtr<T> {
 
     fn verify_deref_preconditions(self) -> Option<Self> {
         let collector = unsafe { &*self.collector };
-        let ptr_addr = self.ptr as *const () as usize;
+        let ptr_addr = self.ptr.expose_provenance();
 
         collector
             .allocations
@@ -86,7 +86,7 @@ impl<T> AtomicAutoPtr<T> {
     pub fn new(collector: &AutoCollector) -> Self {
         Self {
             inner: AtomicUsize::new(0),
-            collector: collector as *const AutoCollector as usize,
+            collector: (collector as *const AutoCollector).expose_provenance(),
             _marker: PhantomData,
         }
     }
@@ -104,7 +104,7 @@ impl<T> AtomicAutoPtr<T> {
     }
 
     pub fn store(&self, value: Option<AutoPtr<T>>, order: Ordering) {
-        let raw = value.map(|g| g.as_ptr() as usize).unwrap_or(0);
+        let raw = value.map(|g| g.as_ptr().expose_provenance()).unwrap_or(0);
         self.inner.store(raw, order);
     }
 
@@ -156,7 +156,6 @@ struct TraceableObject {
 
 pub struct AutoCollector {
     collecting: AtomicBool,
-    running: AtomicBool,
     background_collector_interval: i32,
     steps_per_increment: usize,
     roots: RwLock<HashMap<usize, ()>>,
@@ -164,7 +163,7 @@ pub struct AutoCollector {
     gray_objects: Mutex<VecDeque<usize>>,
     background_collector_thread: Mutex<Option<JoinHandle<()>>>,
     background_cv: Condvar,
-    background_mutex: Mutex<()>,
+    background_state: Mutex<bool>,
 }
 
 pub struct AutoCollectorConfig {
@@ -201,7 +200,7 @@ impl AutoCollector {
     pub fn new(config: AutoCollectorConfig) -> Self {
         Self {
             collecting: AtomicBool::new(false),
-            running: AtomicBool::new(false),
+
             background_collector_interval: config.background_collector_interval,
             steps_per_increment: config.steps_per_increment,
             roots: RwLock::new(HashMap::new()),
@@ -209,19 +208,18 @@ impl AutoCollector {
             gray_objects: Mutex::new(VecDeque::new()),
             background_collector_thread: Mutex::new(None),
             background_cv: Condvar::new(),
-            background_mutex: Mutex::new(()),
+            background_state: Mutex::new(false),
         }
     }
 
     pub fn create<T: Traceable + 'static>(&self, value: T) -> *mut T {
         let boxed_value = Box::new(value);
         let ptr = Box::into_raw(boxed_value);
-        let ptr_addr = ptr as *const () as usize;
+        let ptr_addr = ptr.expose_provenance();
 
         let destructor = {
-            let ptr_copy = ptr as usize;
             Box::new(move || unsafe {
-                let typed_ptr = with_exposed_provenance_mut::<T>(ptr_copy);
+                let typed_ptr = with_exposed_provenance_mut::<T>(ptr_addr);
                 let _ = Box::from_raw(typed_ptr);
             }) as Box<dyn Fn() + Send + Sync>
         };
@@ -241,7 +239,7 @@ impl AutoCollector {
             allocations.insert(ptr_addr, traceable_obj);
         }
 
-        self.add_root_raw(ptr as *const () as usize);
+        self.add_root_raw(ptr.expose_provenance());
         ptr
     }
 
@@ -250,7 +248,7 @@ impl AutoCollector {
     }
 
     pub fn remove_root<T>(&self, ptr: *mut T) -> *mut T {
-        self.remove_root_raw(ptr as *const () as usize);
+        self.remove_root_raw(ptr.expose_provenance());
         ptr
     }
 
@@ -261,7 +259,7 @@ impl AutoCollector {
     }
 
     pub fn add_root<T>(&self, ptr: *mut T) -> *mut T {
-        self.add_root_raw(ptr as *const () as usize);
+        self.add_root_raw(ptr.expose_provenance());
         ptr
     }
 
@@ -374,12 +372,11 @@ impl AutoCollector {
         }
     }
 
-    pub fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.running.load(Ordering::SeqCst) {
-            return Ok(());
-        }
+    pub fn start(&self) {
+        let mut running = self.background_state();
 
-        self.running.store(true, Ordering::SeqCst);
+        *running = true;
+        drop(running);
 
         let collector_ptr = self as *const AutoCollector as usize;
         let handle = thread::spawn(move || {
@@ -390,20 +387,17 @@ impl AutoCollector {
         if let Ok(mut thread_guard) = self.background_collector_thread.lock() {
             *thread_guard = Some(handle);
         }
-
-        Ok(())
     }
 
     fn stop(&self) {
-        if !self.running.load(Ordering::SeqCst) {
+        let mut running = self.background_state();
+        if !*running {
             return;
         }
 
-        self.running.store(false, Ordering::SeqCst);
-
-        if let Ok(_guard) = self.background_mutex.lock() {
-            self.background_cv.notify_one();
-        }
+        *running = false;
+        self.background_cv.notify_one();
+        drop(running);
 
         if let Ok(mut thread_guard) = self.background_collector_thread.lock()
             && let Some(handle) = thread_guard.take()
@@ -412,16 +406,24 @@ impl AutoCollector {
         }
     }
 
+    fn background_state(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.background_state.lock().unwrap()
+    }
+
     fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        *self.background_state()
     }
 
     fn wait_for_collect(&self) -> bool {
-        if let Ok(guard) = self.background_mutex.lock() {
-            let wait_time = Duration::from_millis(self.background_collector_interval as u64);
-            let _ = self.background_cv.wait_timeout(guard, wait_time);
+        let state = self.background_state();
+        if !*state {
+            return false;
         }
-        self.is_running()
+
+        let wait_time = Duration::from_millis(self.background_collector_interval as u64);
+        let (state_guard, _timeout_result) =
+            self.background_cv.wait_timeout(state, wait_time).unwrap();
+        *state_guard
     }
 
     fn background_auto_collector_loop(&self) {
@@ -489,7 +491,7 @@ impl_traceable_basic!(
 mod tests {
     use super::*;
 
-    use std::sync::atomic::Ordering as AtomicOrdering;
+    use std::sync::atomic::Ordering;
 
     #[derive(Debug)]
     struct Node {
@@ -499,17 +501,17 @@ mod tests {
 
     impl Node {
         fn set_next(&self, other: AutoPtr<Node>) {
-            self.next.store(Some(other), AtomicOrdering::Release);
+            self.next.store(Some(other), Ordering::Release);
         }
 
         fn clear_next(&self) {
-            self.next.clear(AtomicOrdering::Release);
+            self.next.clear(Ordering::Release);
         }
     }
 
     impl Traceable for Node {
         fn trace(&self, tracer: &mut Tracer) {
-            if let Some(next_gc) = self.next.load(AtomicOrdering::Acquire) {
+            if let Some(next_gc) = self.next.load(Ordering::Acquire) {
                 tracer.edge(next_gc.as_ptr() as *const ());
             }
         }
