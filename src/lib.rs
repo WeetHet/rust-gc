@@ -1,12 +1,11 @@
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::ops::Deref;
-use std::ptr::{with_exposed_provenance, with_exposed_provenance_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::atomic::{AtomicU32, AtomicUsize};
-use std::sync::{Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -21,22 +20,26 @@ pub trait Traceable: Send + Sync {
     fn trace(&self, tracer: &mut Tracer);
 }
 
-impl<'a> Tracer<'a> {
-    pub fn edge(&mut self, ptr: *const ()) {
-        let ptr_addr = ptr.expose_provenance();
-        if let Some(edges) = &mut self.edges {
-            edges.push(ptr_addr);
-        }
-    }
-}
-
 pub struct Tracer<'a> {
     edges: Option<&'a mut Vec<usize>>,
 }
 
+impl<'a> Tracer<'a> {
+    pub fn edge(&mut self, addr: usize) {
+        if let Some(edges) = &mut self.edges {
+            edges.push(addr);
+        }
+    }
+
+    fn new_edge_collector(edges: &'a mut Vec<usize>) -> Self {
+        Self { edges: Some(edges) }
+    }
+}
+
 pub struct AutoPtr<T> {
-    ptr: *mut T,
+    addr: usize,
     collector: *const AutoCollector,
+    _marker: PhantomData<T>,
 }
 
 impl<T> Copy for AutoPtr<T> {}
@@ -48,64 +51,88 @@ impl<T> Clone for AutoPtr<T> {
 
 impl<T: std::fmt::Debug> std::fmt::Debug for AutoPtr<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.deref().fmt(f)
+        match self.try_deref() {
+            Some(val) => val.fmt(f),
+            None => write!(f, "AutoPtr(freed)"),
+        }
     }
 }
 
 impl<T> AutoPtr<T> {
-    pub fn as_ptr(self) -> *mut T {
-        self.ptr
+    pub fn addr(self) -> usize {
+        self.addr
     }
 
-    fn verify_deref_preconditions(self) -> Option<Self> {
+    fn try_deref(&self) -> Option<&T> {
         let collector = unsafe { &*self.collector };
-        let ptr_addr = self.ptr.expose_provenance();
 
-        collector
-            .allocations
-            .read()
-            .ok()
-            .and_then(|allocations| allocations.get(&ptr_addr).map(|_| self))
+        let allocations = collector.allocations.read().ok()?;
+        let traceable_obj = allocations.get(&self.addr)?;
+
+        unsafe { Some(&*(traceable_obj.ptr as *const T)) }
     }
 }
 
 pub struct AtomicAutoPtr<T> {
     inner: AtomicUsize,
-    collector: usize,
+    collector: *const AutoCollector,
     _marker: PhantomData<T>,
+}
+
+impl<T> Traceable for AtomicAutoPtr<T> {
+    fn trace(&self, tracer: &mut Tracer) {
+        if let Some(ptr) = self.load(Ordering::SeqCst) {
+            tracer.edge(ptr.addr());
+        }
+    }
 }
 
 impl<T> std::fmt::Debug for AtomicAutoPtr<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let addr = self.inner.load(Ordering::Relaxed);
-        write!(f, "GcAtomic({:#x})", addr)
+        write!(f, "AtomicAutoPtr({:#x})", addr)
     }
 }
+
+// Safety: AtomicAutoPtr stores the collector as a usize address and uses AtomicUsize
+// for the inner pointer address. All operations are atomic and thread-safe.
+unsafe impl<T> Send for AtomicAutoPtr<T> {}
+unsafe impl<T> Sync for AtomicAutoPtr<T> {}
 
 impl<T> AtomicAutoPtr<T> {
     pub fn new(collector: &AutoCollector) -> Self {
         Self {
             inner: AtomicUsize::new(0),
-            collector: (collector as *const AutoCollector).expose_provenance(),
+            collector: collector as *const AutoCollector,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn with_ptr(ptr: AutoPtr<T>) -> Self {
+        let addr = ptr.addr();
+        Self {
+            inner: AtomicUsize::new(addr),
+            collector: ptr.collector,
             _marker: PhantomData,
         }
     }
 
     pub fn load(&self, order: Ordering) -> Option<AutoPtr<T>> {
-        let raw = self.inner.load(order);
-        if raw == 0 {
+        let addr = self.inner.load(order);
+        if addr == 0 {
             None
         } else {
             Some(AutoPtr {
-                ptr: with_exposed_provenance_mut(raw),
-                collector: with_exposed_provenance(self.collector),
+                addr,
+                collector: self.collector,
+                _marker: PhantomData,
             })
         }
     }
 
     pub fn store(&self, value: Option<AutoPtr<T>>, order: Ordering) {
-        let raw = value.map(|g| g.as_ptr().expose_provenance()).unwrap_or(0);
-        self.inner.store(raw, order);
+        let addr = value.map(|gc| gc.addr()).unwrap_or(0);
+        self.inner.store(addr, order);
     }
 
     pub fn clear(&self, order: Ordering) {
@@ -116,49 +143,33 @@ impl<T> AtomicAutoPtr<T> {
 impl<T> Deref for AutoPtr<T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
-        let this = self.verify_deref_preconditions().expect(
+        self.try_deref().expect(
             "internal preconditions do not hold: allocation has been freed before dereferencing",
-        );
-        unsafe { &*this.ptr }
-    }
-}
-
-impl AutoCollector {
-    pub fn alloc_gc<T: Traceable + 'static>(&self, value: T) -> AutoPtr<T> {
-        AutoPtr {
-            ptr: self.alloc(value),
-            collector: self as *const _,
-        }
-    }
-
-    pub fn add_root_gc<T>(&self, handle: AutoPtr<T>) -> AutoPtr<T> {
-        self.add_root(handle.ptr);
-        handle
-    }
-
-    pub fn remove_root_gc<T>(&self, handle: AutoPtr<T>) -> AutoPtr<T> {
-        self.remove_root(handle.ptr);
-        handle
-    }
-}
-
-impl<'a> Tracer<'a> {
-    fn new_edge_collector(edges: &'a mut Vec<usize>) -> Self {
-        Self { edges: Some(edges) }
+        )
     }
 }
 
 struct TraceableObject {
     color: Color,
+    ptr: *mut (),
     trace_fn: fn(*const (), &mut Tracer),
-    destructor: Box<dyn Fn() + Send + Sync>,
+    destructor: Box<dyn Fn(*mut ()) + Send + Sync>,
+}
+
+impl std::fmt::Debug for TraceableObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TraceableObject")
+            .field("ptr", &self.ptr)
+            .field("color", &self.color)
+            .finish()
+    }
 }
 
 pub struct AutoCollector {
     collecting: AtomicBool,
-    background_collector_interval: i32,
+    background_collector_interval: u64,
     steps_per_increment: usize,
-    roots: RwLock<HashMap<usize, ()>>,
+    roots: RwLock<HashSet<usize>>,
     allocations: RwLock<HashMap<usize, TraceableObject>>,
     gray_objects: Mutex<VecDeque<usize>>,
     background_collector_thread: Mutex<Option<JoinHandle<()>>>,
@@ -166,9 +177,12 @@ pub struct AutoCollector {
     background_state: Mutex<bool>,
 }
 
+unsafe impl Send for AutoCollector {}
+unsafe impl Sync for AutoCollector {}
+
 pub struct AutoCollectorConfig {
     pub steps_per_increment: usize,
-    pub background_collector_interval: i32,
+    pub background_collector_interval: u64,
 }
 
 impl Default for AutoCollectorConfig {
@@ -188,7 +202,7 @@ impl AutoCollectorConfig {
         }
     }
 
-    fn with_background_collector_interval(self, background_collector_interval: i32) -> Self {
+    fn with_background_collector_interval(self, background_collector_interval: u64) -> Self {
         Self {
             background_collector_interval,
             ..self
@@ -197,32 +211,50 @@ impl AutoCollectorConfig {
 }
 
 impl AutoCollector {
-    pub fn new(config: AutoCollectorConfig) -> Self {
-        Self {
+    pub fn new(config: AutoCollectorConfig) -> Arc<Self> {
+        Arc::new(Self {
             collecting: AtomicBool::new(false),
-
             background_collector_interval: config.background_collector_interval,
             steps_per_increment: config.steps_per_increment,
-            roots: RwLock::new(HashMap::new()),
+            roots: RwLock::new(HashSet::new()),
             allocations: RwLock::new(HashMap::new()),
             gray_objects: Mutex::new(VecDeque::new()),
             background_collector_thread: Mutex::new(None),
             background_cv: Condvar::new(),
             background_state: Mutex::new(false),
+        })
+    }
+
+    pub fn alloc<T: Traceable + 'static>(&self, value: T) -> AutoPtr<T> {
+        let ptr = self.create(value);
+        let addr = ptr as usize;
+
+        AutoPtr {
+            addr,
+            collector: self as *const _,
+            _marker: PhantomData,
         }
+    }
+
+    pub fn add_root<T>(&self, handle: AutoPtr<T>) -> AutoPtr<T> {
+        self.add_root_raw(handle.addr);
+        handle
+    }
+
+    pub fn remove_root<T>(&self, handle: AutoPtr<T>) -> AutoPtr<T> {
+        self.remove_root_raw(handle.addr);
+        handle
     }
 
     pub fn create<T: Traceable + 'static>(&self, value: T) -> *mut T {
         let boxed_value = Box::new(value);
         let ptr = Box::into_raw(boxed_value);
-        let ptr_addr = ptr.expose_provenance();
+        let addr = ptr as usize;
 
-        let destructor = {
-            Box::new(move || unsafe {
-                let typed_ptr = with_exposed_provenance_mut::<T>(ptr_addr);
-                let _ = Box::from_raw(typed_ptr);
-            }) as Box<dyn Fn() + Send + Sync>
-        };
+        let destructor = Box::new(move |ptr: *mut ()| unsafe {
+            let reconstructed_ptr = ptr as *mut T;
+            let _ = Box::from_raw(reconstructed_ptr);
+        }) as Box<dyn Fn(*mut ()) + Send + Sync>;
 
         let trace_fn = |ptr: *const (), tracer: &mut Tracer| {
             let typed_ptr = ptr as *const T;
@@ -230,42 +262,30 @@ impl AutoCollector {
         };
 
         let traceable_obj = TraceableObject {
-            color: Color::White,
+            color: Color::Gray,
+            ptr: ptr as *mut (),
             trace_fn,
             destructor,
         };
 
+        self.add_root_raw(addr);
+
         if let Ok(mut allocations) = self.allocations.write() {
-            allocations.insert(ptr_addr, traceable_obj);
+            allocations.insert(addr, traceable_obj);
         }
 
-        self.add_root_raw(ptr.expose_provenance());
         ptr
     }
 
-    pub fn alloc<T: Traceable + 'static>(&self, value: T) -> *mut T {
-        self.create(value)
-    }
-
-    pub fn remove_root<T>(&self, ptr: *mut T) -> *mut T {
-        self.remove_root_raw(ptr.expose_provenance());
-        ptr
-    }
-
-    pub fn remove_root_raw(&self, ptr_addr: usize) {
+    pub fn remove_root_raw(&self, addr: usize) {
         if let Ok(mut roots) = self.roots.write() {
-            roots.remove(&ptr_addr);
+            roots.remove(&addr);
         }
     }
 
-    pub fn add_root<T>(&self, ptr: *mut T) -> *mut T {
-        self.add_root_raw(ptr.expose_provenance());
-        ptr
-    }
-
-    pub fn add_root_raw(&self, ptr_addr: usize) {
+    pub fn add_root_raw(&self, addr: usize) {
         if let Ok(mut roots) = self.roots.write() {
-            roots.insert(ptr_addr, ());
+            roots.insert(addr);
         }
     }
 
@@ -285,7 +305,7 @@ impl AutoCollector {
         ) {
             gray_objects.clear();
 
-            for root_addr in roots.keys() {
+            for root_addr in roots.iter() {
                 if let Some(traceable_obj) = allocations.get_mut(root_addr) {
                     traceable_obj.color = Color::Gray;
                     gray_objects.push_back(*root_addr);
@@ -326,12 +346,13 @@ impl AutoCollector {
 
             traceable_object.color = Color::Black;
             let trace_fn = traceable_object.trace_fn;
+            let ptr = traceable_object.ptr;
 
             drop(allocations);
 
             let mut edges = Vec::new();
             let mut tracer = Tracer::new_edge_collector(&mut edges);
-            trace_fn(with_exposed_provenance(current_addr), &mut tracer);
+            trace_fn(ptr as *const (), &mut tracer);
 
             for edge_addr in edges {
                 if let Ok(mut allocations) = self.allocations.write()
@@ -359,7 +380,7 @@ impl AutoCollector {
 
                 for addr in white_addrs {
                     if let Some(traceable_obj) = allocations.remove(&addr) {
-                        (traceable_obj.destructor)();
+                        (traceable_obj.destructor)(traceable_obj.ptr);
                     }
                 }
 
@@ -372,16 +393,15 @@ impl AutoCollector {
         }
     }
 
-    pub fn start(&self) {
+    pub fn start(self: &Arc<Self>) {
         let mut running = self.background_state();
 
         *running = true;
         drop(running);
 
-        let collector_ptr = self as *const AutoCollector as usize;
+        let _self = self.clone();
         let handle = thread::spawn(move || {
-            let collector = unsafe { &*with_exposed_provenance::<AutoCollector>(collector_ptr) };
-            collector.background_auto_collector_loop();
+            _self.background_auto_collector_loop();
         });
 
         if let Ok(mut thread_guard) = self.background_collector_thread.lock() {
@@ -420,7 +440,7 @@ impl AutoCollector {
             return false;
         }
 
-        let wait_time = Duration::from_millis(self.background_collector_interval as u64);
+        let wait_time = Duration::from_millis(self.background_collector_interval);
         let (state_guard, _timeout_result) =
             self.background_cv.wait_timeout(state, wait_time).unwrap();
         *state_guard
@@ -467,7 +487,7 @@ impl Drop for AutoCollector {
         if let Ok(mut allocations) = self.allocations.write() {
             allocations
                 .drain()
-                .for_each(|(_, traceable_obj)| (traceable_obj.destructor)());
+                .for_each(|(_, traceable_obj)| (traceable_obj.destructor)(traceable_obj.ptr));
         }
     }
 }
@@ -486,6 +506,22 @@ impl_traceable_basic!(
     i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64, bool, char, String,
     &str, AtomicU32
 );
+
+impl<T: Send + Traceable> Traceable for Mutex<T> {
+    fn trace(&self, tracer: &mut Tracer) {
+        self.lock().unwrap().trace(tracer);
+    }
+}
+
+impl<T> Traceable for Vec<AtomicAutoPtr<T>> {
+    fn trace(&self, tracer: &mut Tracer) {
+        for atomic_ptr in self {
+            if let Some(ptr) = atomic_ptr.load(Ordering::SeqCst) {
+                tracer.edge(ptr.addr());
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -512,7 +548,7 @@ mod tests {
     impl Traceable for Node {
         fn trace(&self, tracer: &mut Tracer) {
             if let Some(next_gc) = self.next.load(Ordering::Acquire) {
-                tracer.edge(next_gc.as_ptr() as *const ());
+                tracer.edge(next_gc.addr());
             }
         }
     }
@@ -521,11 +557,11 @@ mod tests {
     fn test_basic_allocation_and_collection() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let obj = gc.alloc_gc(Node {
+        let obj = gc.alloc(Node {
             value: 42,
             next: AtomicAutoPtr::new(&gc),
         });
-        gc.remove_root_gc(obj);
+        gc.remove_root(obj);
 
         let before_count = gc.allocation_count();
         assert_eq!(before_count, 1);
@@ -540,18 +576,18 @@ mod tests {
     fn test_object_reachability_through_traces() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let parent = gc.alloc_gc(Node {
+        let parent = gc.alloc(Node {
             value: 1,
             next: AtomicAutoPtr::new(&gc),
         });
-        let child = gc.alloc_gc(Node {
+        let child = gc.alloc(Node {
             value: 2,
             next: AtomicAutoPtr::new(&gc),
         });
 
         parent.set_next(child);
 
-        gc.remove_root_gc(child);
+        gc.remove_root(child);
 
         let before_count = gc.allocation_count();
         assert_eq!(before_count, 2);
@@ -561,7 +597,7 @@ mod tests {
         let after_count = gc.allocation_count();
         assert_eq!(after_count, 2);
 
-        gc.remove_root_gc(parent);
+        gc.remove_root(parent);
 
         gc.manual_gc();
 
@@ -573,18 +609,18 @@ mod tests {
     fn test_breaking_reachability() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let parent = gc.alloc_gc(Node {
+        let parent = gc.alloc(Node {
             value: 1,
             next: AtomicAutoPtr::new(&gc),
         });
-        let child = gc.alloc_gc(Node {
+        let child = gc.alloc(Node {
             value: 2,
             next: AtomicAutoPtr::new(&gc),
         });
 
         parent.set_next(child);
 
-        gc.remove_root_gc(child);
+        gc.remove_root(child);
 
         assert_eq!(gc.allocation_count(), 2);
 
@@ -599,11 +635,11 @@ mod tests {
     fn test_cyclic_references_with_trace() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let a = gc.alloc_gc(Node {
+        let a = gc.alloc(Node {
             value: 1,
             next: AtomicAutoPtr::new(&gc),
         });
-        let b = gc.alloc_gc(Node {
+        let b = gc.alloc(Node {
             value: 2,
             next: AtomicAutoPtr::new(&gc),
         });
@@ -611,8 +647,8 @@ mod tests {
         a.set_next(b);
         b.set_next(a);
 
-        gc.remove_root_gc(a);
-        gc.remove_root_gc(b);
+        gc.remove_root(a);
+        gc.remove_root(b);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 0);
@@ -622,21 +658,21 @@ mod tests {
     fn test_re_adding_to_roots() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let parent = gc.alloc_gc(Node {
+        let parent = gc.alloc(Node {
             value: 1,
             next: AtomicAutoPtr::new(&gc),
         });
-        let child = gc.alloc_gc(Node {
+        let child = gc.alloc(Node {
             value: 2,
             next: AtomicAutoPtr::new(&gc),
         });
 
         parent.set_next(child);
 
-        gc.remove_root_gc(parent);
-        gc.remove_root_gc(child);
+        gc.remove_root(parent);
+        gc.remove_root(child);
 
-        gc.add_root_gc(child);
+        gc.add_root(child);
 
         gc.manual_gc();
 
@@ -647,11 +683,11 @@ mod tests {
     fn test_multiple_manual_collections() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let a = gc.alloc_gc(Node {
+        let a = gc.alloc(Node {
             value: 1,
             next: AtomicAutoPtr::new(&gc),
         });
-        let b = gc.alloc_gc(Node {
+        let b = gc.alloc(Node {
             value: 2,
             next: AtomicAutoPtr::new(&gc),
         });
@@ -661,12 +697,12 @@ mod tests {
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 2);
 
-        gc.remove_root_gc(b);
+        gc.remove_root(b);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 2);
 
-        gc.remove_root_gc(a);
+        gc.remove_root(a);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 0);
@@ -681,33 +717,32 @@ mod tests {
 
         #[derive(Debug)]
         struct Graph {
-            nodes: [AutoPtr<Node>; 4],
+            nodes: [AtomicAutoPtr<Node>; 4],
         }
-
-        unsafe impl Send for Graph {}
-        unsafe impl Sync for Graph {}
 
         impl Traceable for Graph {
             fn trace(&self, tracer: &mut Tracer) {
-                for &node in &self.nodes {
-                    tracer.edge(node.as_ptr() as *const ());
+                for node in &self.nodes {
+                    if let Some(node) = node.load(Ordering::SeqCst) {
+                        tracer.edge(node.addr());
+                    }
                 }
             }
         }
 
-        let a = gc.alloc_gc(Node {
+        let a = gc.alloc(Node {
             value: 1,
             next: AtomicAutoPtr::new(&gc),
         });
-        let b = gc.alloc_gc(Node {
+        let b = gc.alloc(Node {
             value: 2,
             next: AtomicAutoPtr::new(&gc),
         });
-        let c = gc.alloc_gc(Node {
+        let c = gc.alloc(Node {
             value: 3,
             next: AtomicAutoPtr::new(&gc),
         });
-        let d = gc.alloc_gc(Node {
+        let d = gc.alloc(Node {
             value: 4,
             next: AtomicAutoPtr::new(&gc),
         });
@@ -717,19 +752,19 @@ mod tests {
         c.set_next(d);
         d.set_next(a);
 
-        let graph = gc.alloc_gc(Graph {
-            nodes: [a, b, c, d],
+        let graph = gc.alloc(Graph {
+            nodes: [a, b, c, d].map(AtomicAutoPtr::with_ptr),
         });
 
-        gc.remove_root_gc(a);
-        gc.remove_root_gc(b);
-        gc.remove_root_gc(c);
-        gc.remove_root_gc(d);
+        gc.remove_root(a);
+        gc.remove_root(b);
+        gc.remove_root(c);
+        gc.remove_root(d);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 5);
 
-        gc.remove_root_gc(graph);
+        gc.remove_root(graph);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 0);
@@ -742,7 +777,7 @@ mod tests {
         for _ in 0..5 {
             let objects: Vec<AutoPtr<Node>> = (0..10)
                 .map(|i| {
-                    gc.alloc_gc(Node {
+                    gc.alloc(Node {
                         value: i,
                         next: AtomicAutoPtr::new(&gc),
                     })
@@ -754,12 +789,12 @@ mod tests {
             }
 
             for &obj in &objects[1..] {
-                gc.remove_root_gc(obj);
+                gc.remove_root(obj);
             }
 
             assert_eq!(gc.allocation_count(), 10);
 
-            gc.remove_root_gc(objects[0]);
+            gc.remove_root(objects[0]);
 
             gc.manual_gc();
             assert_eq!(gc.allocation_count(), 0);
@@ -770,14 +805,14 @@ mod tests {
     fn test_self_referencing_object() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let node = gc.alloc_gc(Node {
+        let node = gc.alloc(Node {
             value: 42,
             next: AtomicAutoPtr::new(&gc),
         });
 
         node.set_next(node);
 
-        gc.remove_root_gc(node);
+        gc.remove_root(node);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 0);
@@ -787,37 +822,37 @@ mod tests {
     fn test_partial_graph_collection() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let root = gc.alloc_gc(Node {
+        let root = gc.alloc(Node {
             value: 0,
             next: AtomicAutoPtr::new(&gc),
         });
 
-        let a = gc.alloc_gc(Node {
+        let a = gc.alloc(Node {
             value: 1,
             next: AtomicAutoPtr::new(&gc),
         });
-        let b = gc.alloc_gc(Node {
+        let b = gc.alloc(Node {
             value: 2,
             next: AtomicAutoPtr::new(&gc),
         });
-        let c = gc.alloc_gc(Node {
+        let c = gc.alloc(Node {
             value: 3,
             next: AtomicAutoPtr::new(&gc),
         });
-        let d = gc.alloc_gc(Node {
+        let d = gc.alloc(Node {
             value: 4,
             next: AtomicAutoPtr::new(&gc),
         });
-        let e = gc.alloc_gc(Node {
+        let e = gc.alloc(Node {
             value: 5,
             next: AtomicAutoPtr::new(&gc),
         });
 
-        gc.remove_root_gc(a);
-        gc.remove_root_gc(b);
-        gc.remove_root_gc(c);
-        gc.remove_root_gc(d);
-        gc.remove_root_gc(e);
+        gc.remove_root(a);
+        gc.remove_root(b);
+        gc.remove_root(c);
+        gc.remove_root(d);
+        gc.remove_root(e);
 
         root.set_next(a);
         a.set_next(b);
@@ -835,20 +870,20 @@ mod tests {
     }
 
     #[test]
-    fn incorrect() {
+    fn remove_before_gc() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let obj = gc.alloc_gc(Node {
+        let obj = gc.alloc(Node {
             value: 42,
             next: AtomicAutoPtr::new(&gc),
         });
 
-        let next_node = gc.alloc_gc(Node {
+        let next_node = gc.alloc(Node {
             value: 179,
             next: AtomicAutoPtr::new(&gc),
         });
 
-        gc.remove_root_gc(next_node);
+        gc.remove_root(next_node);
         gc.manual_gc();
 
         obj.set_next(next_node);
@@ -871,7 +906,7 @@ mod tests {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
         let a = AtomicAutoPtr::new(&gc);
-        a.store(Some(gc.alloc_gc(AtomicU32::new(0))), Ordering::Release);
+        a.store(Some(gc.alloc(AtomicU32::new(0))), Ordering::Release);
 
         thread::scope(|s| {
             s.spawn(|| {
@@ -891,5 +926,79 @@ mod tests {
 
         let final_value = a.load(Ordering::Acquire).unwrap().load(Ordering::Acquire);
         assert!(final_value == 3 || final_value == 4);
+    }
+
+    #[test]
+    fn multithreaded_usage() {
+        let gc = AutoCollector::new(AutoCollectorConfig::default());
+        gc.start();
+
+        let init = gc.alloc(Node {
+            value: 100,
+            next: AtomicAutoPtr::new(&gc),
+        });
+        let last_vertex = AtomicAutoPtr::with_ptr(init);
+
+        let roots: AtomicAutoPtr<Mutex<Vec<AtomicAutoPtr<Node>>>> =
+            AtomicAutoPtr::with_ptr(gc.alloc(Mutex::new(Vec::new())));
+
+        let add_root = |roots: &AtomicAutoPtr<Mutex<Vec<AtomicAutoPtr<Node>>>>,
+                        new: &AtomicAutoPtr<Node>| {
+            let Some(vertex) = new.load(Ordering::Acquire) else {
+                return;
+            };
+
+            roots
+                .load(Ordering::Acquire)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .push(AtomicAutoPtr::with_ptr(vertex));
+        };
+
+        add_root(&roots, &last_vertex);
+        gc.remove_root(init);
+
+        thread::scope(|s| {
+            for thread_id in 0..4 {
+                let (shared_ptr, gc) = (&last_vertex, &gc);
+                let (roots, add_root) = (&roots, &add_root);
+
+                s.spawn(move || {
+                    for i in 0..10 {
+                        if let Some(current) = shared_ptr.load(Ordering::Acquire) {
+                            let new_node = gc.alloc(Node {
+                                value: thread_id * 1000 + i,
+                                next: AtomicAutoPtr::new(gc),
+                            });
+
+                            add_root(roots, &AtomicAutoPtr::with_ptr(new_node));
+
+                            new_node.set_next(current);
+                            shared_ptr.store(Some(new_node), Ordering::Release);
+
+                            gc.remove_root(new_node);
+                        }
+
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                });
+            }
+        });
+
+        let final_node = last_vertex.load(Ordering::Acquire).unwrap();
+        assert!(final_node.value < 4000);
+
+        last_vertex.clear(Ordering::Release);
+        gc.remove_root(roots.load(Ordering::Acquire).unwrap());
+        thread::sleep(Duration::from_millis(
+            AutoCollectorConfig::default().background_collector_interval,
+        ));
+
+        gc.stop();
+
+        gc.manual_gc();
+
+        assert_eq!(gc.allocation_count(), 0);
     }
 }

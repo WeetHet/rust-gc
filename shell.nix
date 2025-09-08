@@ -19,5 +19,6 @@ pkgs.mkShell {
     ))
     pkgs.cargo-nextest
   ];
-  env.MIRIFLAGS = "-Zmiri-permissive-provenance";
+  env.MIRIFLAGS = "-Zmiri-disable-isolation -Zmiri-env-forward=RUST_BACKTRACE";
+  env.RUST_BACKTRACE = 1;
 }

@@ -11,17 +11,17 @@ struct TreeNode {
 impl Traceable for TreeNode {
     fn trace(&self, tracer: &mut Tracer) {
         if let Some(left_gc) = self.left.load(Ordering::Acquire) {
-            tracer.edge(left_gc.as_ptr() as *const ());
+            tracer.edge(left_gc.addr());
         }
         if let Some(right_gc) = self.right.load(Ordering::Acquire) {
-            tracer.edge(right_gc.as_ptr() as *const ());
+            tracer.edge(right_gc.addr());
         }
     }
 }
 
 impl TreeNode {
     fn new(collector: &AutoCollector, value: i32) -> AutoPtr<TreeNode> {
-        collector.alloc_gc(TreeNode {
+        collector.alloc(TreeNode {
             value,
             left: AtomicAutoPtr::new(collector),
             right: AtomicAutoPtr::new(collector),
@@ -34,14 +34,14 @@ impl TreeNode {
                 left.insert(collector, value);
             } else {
                 let new_node = TreeNode::new(collector, value);
-                collector.remove_root_gc(new_node);
+                collector.remove_root(new_node);
                 self.left.store(Some(new_node), Ordering::Release);
             }
         } else if let Some(right) = self.right.load(Ordering::Acquire) {
             right.insert(collector, value);
         } else {
             let new_node = TreeNode::new(collector, value);
-            collector.remove_root_gc(new_node);
+            collector.remove_root(new_node);
             self.right.store(Some(new_node), Ordering::Release);
         }
     }
