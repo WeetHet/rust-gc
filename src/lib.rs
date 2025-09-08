@@ -2,10 +2,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::ptr::{with_exposed_provenance, with_exposed_provenance_mut};
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -120,15 +120,6 @@ impl<T> Deref for AutoPtr<T> {
             "internal preconditions do not hold: allocation has been freed before dereferencing",
         );
         unsafe { &*this.ptr }
-    }
-}
-
-impl<T> DerefMut for AutoPtr<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        let this = self.verify_deref_preconditions().expect(
-            "internal preconditions do not hold: allocation has been freed before dereferencing",
-        );
-        unsafe { &mut *this.ptr }
     }
 }
 
@@ -511,7 +502,7 @@ macro_rules! impl_traceable_basic {
 
 impl_traceable_basic!(
     i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64, bool, char, String,
-    &str
+    &str, AtomicU32
 );
 
 #[cfg(test)]
@@ -893,29 +884,30 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // #[test]
-    // fn data_race() {
-    //     let gc = AutoCollector::new(AutoCollectorConfig::default());
+    #[test]
+    fn no_data_race() {
+        let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-    //     let a = AtomicAutoPtr::new(&gc);
-    //     a.store(Some(gc.alloc_gc(3)), Ordering::Release);
+        let a = AtomicAutoPtr::new(&gc);
+        a.store(Some(gc.alloc_gc(AtomicU32::new(0))), Ordering::Release);
 
-    //     thread::scope(|s| {
-    //         s.spawn(|| {
-    //             thread::sleep(Duration::from_millis(100));
+        thread::scope(|s| {
+            s.spawn(|| {
+                thread::sleep(Duration::from_millis(10));
 
-    //             let mut x = a.load(Ordering::Acquire).unwrap();
-    //             *x = 3;
-    //         });
+                let x = a.load(Ordering::Acquire).unwrap();
+                x.store(3, Ordering::Release);
+            });
 
-    //         s.spawn(|| {
-    //             thread::sleep(Duration::from_millis(100));
+            s.spawn(|| {
+                thread::sleep(Duration::from_millis(10));
 
-    //             let mut x = a.load(Ordering::Acquire).unwrap();
-    //             *x = 4;
-    //         });
-    //     });
+                let x = a.load(Ordering::Acquire).unwrap();
+                x.store(4, Ordering::Release);
+            });
+        });
 
-    //     assert_eq!(*a.load(Ordering::Acquire).unwrap(), 3);
-    // }
+        let final_value = a.load(Ordering::Acquire).unwrap().load(Ordering::Acquire);
+        assert!(final_value == 3 || final_value == 4);
+    }
 }
