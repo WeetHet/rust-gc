@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::ptr::{with_exposed_provenance, with_exposed_provenance_mut};
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -29,6 +32,123 @@ impl<'a> Tracer<'a> {
 
 pub struct Tracer<'a> {
     edges: Option<&'a mut Vec<usize>>,
+}
+
+pub struct AutoPtr<T> {
+    ptr: *mut T,
+    collector: *const AutoCollector,
+}
+
+impl<T> Copy for AutoPtr<T> {}
+impl<T> Clone for AutoPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for AutoPtr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.deref().fmt(f)
+    }
+}
+
+impl<T> AutoPtr<T> {
+    pub fn as_ptr(self) -> *mut T {
+        self.ptr
+    }
+
+    fn verify_deref_preconditions(self) -> Option<Self> {
+        let collector = unsafe { &*self.collector };
+        let ptr_addr = self.ptr as *const () as usize;
+
+        collector
+            .allocations
+            .read()
+            .ok()
+            .and_then(|allocations| allocations.get(&ptr_addr).map(|_| self))
+    }
+}
+
+pub struct AtomicAutoPtr<T> {
+    inner: AtomicUsize,
+    collector: usize,
+    _marker: PhantomData<T>,
+}
+
+impl<T> std::fmt::Debug for AtomicAutoPtr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let addr = self.inner.load(Ordering::Relaxed);
+        write!(f, "GcAtomic({:#x})", addr)
+    }
+}
+
+impl<T> AtomicAutoPtr<T> {
+    pub fn new(collector: &AutoCollector) -> Self {
+        Self {
+            inner: AtomicUsize::new(0),
+            collector: collector as *const AutoCollector as usize,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn load(&self, order: Ordering) -> Option<AutoPtr<T>> {
+        let raw = self.inner.load(order);
+        if raw == 0 {
+            None
+        } else {
+            Some(AutoPtr {
+                ptr: with_exposed_provenance_mut(raw),
+                collector: with_exposed_provenance(self.collector),
+            })
+        }
+    }
+
+    pub fn store(&self, value: Option<AutoPtr<T>>, order: Ordering) {
+        let raw = value.map(|g| g.as_ptr() as usize).unwrap_or(0);
+        self.inner.store(raw, order);
+    }
+
+    pub fn clear(&self, order: Ordering) {
+        self.inner.store(0, order);
+    }
+}
+
+impl<T> Deref for AutoPtr<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        let this = self.verify_deref_preconditions().expect(
+            "internal preconditions do not hold: allocation has been freed before dereferencing",
+        );
+        unsafe { &*this.ptr }
+    }
+}
+
+impl<T> DerefMut for AutoPtr<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let this = self.verify_deref_preconditions().expect(
+            "internal preconditions do not hold: allocation has been freed before dereferencing",
+        );
+        unsafe { &mut *this.ptr }
+    }
+}
+
+impl AutoCollector {
+    pub fn alloc_gc<T: Traceable + 'static>(&self, value: T) -> AutoPtr<T> {
+        AutoPtr {
+            ptr: self.alloc(value),
+            collector: self as *const _,
+        }
+    }
+
+    pub fn add_root_gc<T>(&self, handle: AutoPtr<T>) -> AutoPtr<T> {
+        self.add_root(handle.ptr);
+        handle
+    }
+
+    pub fn remove_root_gc<T>(&self, handle: AutoPtr<T>) -> AutoPtr<T> {
+        self.remove_root(handle.ptr);
+        handle
+    }
 }
 
 impl<'a> Tracer<'a> {
@@ -379,28 +499,47 @@ impl Drop for AutoCollector {
     }
 }
 
+macro_rules! impl_traceable_basic {
+    ($($t:ty),*) => {
+        $(
+            impl Traceable for $t {
+                fn trace(&self, _tracer: &mut Tracer) { }
+            }
+        )*
+    };
+}
+
+impl_traceable_basic!(
+    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64, bool, char, String,
+    &str
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicPtr, Ordering as AtomicOrdering};
+    use std::sync::atomic::Ordering as AtomicOrdering;
 
     #[derive(Debug)]
     struct Node {
         value: u32,
-        next: Option<AtomicPtr<Node>>,
+        next: AtomicAutoPtr<Node>,
     }
 
-    unsafe impl Send for Node {}
-    unsafe impl Sync for Node {}
+    impl Node {
+        fn set_next(&self, other: AutoPtr<Node>) {
+            self.next.store(Some(other), AtomicOrdering::Release);
+        }
+
+        fn clear_next(&self) {
+            self.next.clear(AtomicOrdering::Release);
+        }
+    }
 
     impl Traceable for Node {
         fn trace(&self, tracer: &mut Tracer) {
-            if let Some(ref next_atomic) = self.next {
-                let next_ptr = next_atomic.load(AtomicOrdering::Acquire);
-                if !next_ptr.is_null() {
-                    tracer.edge(next_ptr as *const ());
-                }
+            if let Some(next_gc) = self.next.load(AtomicOrdering::Acquire) {
+                tracer.edge(next_gc.as_ptr() as *const ());
             }
         }
     }
@@ -409,11 +548,11 @@ mod tests {
     fn test_basic_allocation_and_collection() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let obj = gc.alloc(Node {
+        let obj = gc.alloc_gc(Node {
             value: 42,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
-        gc.remove_root(obj);
+        gc.remove_root_gc(obj);
 
         let before_count = gc.allocation_count();
         assert_eq!(before_count, 1);
@@ -428,22 +567,18 @@ mod tests {
     fn test_object_reachability_through_traces() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let parent = gc.alloc(Node {
+        let parent = gc.alloc_gc(Node {
             value: 1,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
-        let child = gc.alloc(Node {
+        let child = gc.alloc_gc(Node {
             value: 2,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
 
-        unsafe {
-            if let Some(ref next_atomic) = (*parent).next {
-                next_atomic.store(child, AtomicOrdering::Release);
-            }
-        }
+        parent.set_next(child);
 
-        gc.remove_root(child);
+        gc.remove_root_gc(child);
 
         let before_count = gc.allocation_count();
         assert_eq!(before_count, 2);
@@ -453,7 +588,7 @@ mod tests {
         let after_count = gc.allocation_count();
         assert_eq!(after_count, 2);
 
-        gc.remove_root(parent);
+        gc.remove_root_gc(parent);
 
         gc.manual_gc();
 
@@ -465,30 +600,22 @@ mod tests {
     fn test_breaking_reachability() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let parent = gc.alloc(Node {
+        let parent = gc.alloc_gc(Node {
             value: 1,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
-        let child = gc.alloc(Node {
+        let child = gc.alloc_gc(Node {
             value: 2,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
 
-        unsafe {
-            if let Some(ref next_atomic) = (*parent).next {
-                next_atomic.store(child, AtomicOrdering::Release);
-            }
-        }
+        parent.set_next(child);
 
-        gc.remove_root(child);
+        gc.remove_root_gc(child);
 
         assert_eq!(gc.allocation_count(), 2);
 
-        unsafe {
-            if let Some(ref next_atomic) = (*parent).next {
-                next_atomic.store(std::ptr::null_mut(), AtomicOrdering::Release);
-            }
-        }
+        parent.clear_next();
 
         gc.manual_gc();
 
@@ -499,26 +626,20 @@ mod tests {
     fn test_cyclic_references_with_trace() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let a = gc.alloc(Node {
+        let a = gc.alloc_gc(Node {
             value: 1,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
-        let b = gc.alloc(Node {
+        let b = gc.alloc_gc(Node {
             value: 2,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
 
-        unsafe {
-            if let Some(ref next_atomic) = (*a).next {
-                next_atomic.store(b, AtomicOrdering::Release);
-            }
-            if let Some(ref next_atomic) = (*b).next {
-                next_atomic.store(a, AtomicOrdering::Release);
-            }
-        }
+        a.set_next(b);
+        b.set_next(a);
 
-        gc.remove_root(a);
-        gc.remove_root(b);
+        gc.remove_root_gc(a);
+        gc.remove_root_gc(b);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 0);
@@ -528,25 +649,21 @@ mod tests {
     fn test_re_adding_to_roots() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let parent = gc.alloc(Node {
+        let parent = gc.alloc_gc(Node {
             value: 1,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
-        let child = gc.alloc(Node {
+        let child = gc.alloc_gc(Node {
             value: 2,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
 
-        unsafe {
-            if let Some(ref next_atomic) = (*parent).next {
-                next_atomic.store(child, AtomicOrdering::Release);
-            }
-        }
+        parent.set_next(child);
 
-        gc.remove_root(parent);
-        gc.remove_root(child);
+        gc.remove_root_gc(parent);
+        gc.remove_root_gc(child);
 
-        gc.add_root(child);
+        gc.add_root_gc(child);
 
         gc.manual_gc();
 
@@ -557,30 +674,26 @@ mod tests {
     fn test_multiple_manual_collections() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let a = gc.alloc(Node {
+        let a = gc.alloc_gc(Node {
             value: 1,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
-        let b = gc.alloc(Node {
+        let b = gc.alloc_gc(Node {
             value: 2,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
 
-        unsafe {
-            if let Some(ref next_atomic) = (*a).next {
-                next_atomic.store(b, AtomicOrdering::Release);
-            }
-        }
+        a.set_next(b);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 2);
 
-        gc.remove_root(b);
+        gc.remove_root_gc(b);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 2);
 
-        gc.remove_root(a);
+        gc.remove_root_gc(a);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 0);
@@ -595,7 +708,7 @@ mod tests {
 
         #[derive(Debug)]
         struct Graph {
-            nodes: [*mut Node; 4],
+            nodes: [AutoPtr<Node>; 4],
         }
 
         unsafe impl Send for Graph {}
@@ -604,58 +717,46 @@ mod tests {
         impl Traceable for Graph {
             fn trace(&self, tracer: &mut Tracer) {
                 for &node in &self.nodes {
-                    if !node.is_null() {
-                        tracer.edge(node as *const ());
-                    }
+                    tracer.edge(node.as_ptr() as *const ());
                 }
             }
         }
 
-        let a = gc.alloc(Node {
+        let a = gc.alloc_gc(Node {
             value: 1,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
-        let b = gc.alloc(Node {
+        let b = gc.alloc_gc(Node {
             value: 2,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
-        let c = gc.alloc(Node {
+        let c = gc.alloc_gc(Node {
             value: 3,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
-        let d = gc.alloc(Node {
+        let d = gc.alloc_gc(Node {
             value: 4,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
 
-        unsafe {
-            if let Some(ref next_atomic) = (*a).next {
-                next_atomic.store(b, AtomicOrdering::Release);
-            }
-            if let Some(ref next_atomic) = (*b).next {
-                next_atomic.store(c, AtomicOrdering::Release);
-            }
-            if let Some(ref next_atomic) = (*c).next {
-                next_atomic.store(d, AtomicOrdering::Release);
-            }
-            if let Some(ref next_atomic) = (*d).next {
-                next_atomic.store(a, AtomicOrdering::Release);
-            }
-        }
+        a.set_next(b);
+        b.set_next(c);
+        c.set_next(d);
+        d.set_next(a);
 
-        let graph = gc.alloc(Graph {
+        let graph = gc.alloc_gc(Graph {
             nodes: [a, b, c, d],
         });
 
-        gc.remove_root(a);
-        gc.remove_root(b);
-        gc.remove_root(c);
-        gc.remove_root(d);
+        gc.remove_root_gc(a);
+        gc.remove_root_gc(b);
+        gc.remove_root_gc(c);
+        gc.remove_root_gc(d);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 5);
 
-        gc.remove_root(graph);
+        gc.remove_root_gc(graph);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 0);
@@ -666,30 +767,26 @@ mod tests {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
         for _ in 0..5 {
-            let objects: Vec<*mut Node> = (0..10)
+            let objects: Vec<AutoPtr<Node>> = (0..10)
                 .map(|i| {
-                    gc.alloc(Node {
+                    gc.alloc_gc(Node {
                         value: i,
-                        next: Some(AtomicPtr::new(std::ptr::null_mut())),
+                        next: AtomicAutoPtr::new(&gc),
                     })
                 })
                 .collect();
 
             for i in 0..objects.len() - 1 {
-                unsafe {
-                    if let Some(ref next_atomic) = (*objects[i]).next {
-                        next_atomic.store(objects[i + 1], AtomicOrdering::Release);
-                    }
-                }
+                objects[i].set_next(objects[i + 1]);
             }
 
             for &obj in &objects[1..] {
-                gc.remove_root(obj);
+                gc.remove_root_gc(obj);
             }
 
             assert_eq!(gc.allocation_count(), 10);
 
-            gc.remove_root(objects[0]);
+            gc.remove_root_gc(objects[0]);
 
             gc.manual_gc();
             assert_eq!(gc.allocation_count(), 0);
@@ -700,18 +797,14 @@ mod tests {
     fn test_self_referencing_object() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let node = gc.alloc(Node {
+        let node = gc.alloc_gc(Node {
             value: 42,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
 
-        unsafe {
-            if let Some(ref next_atomic) = (*node).next {
-                next_atomic.store(node, AtomicOrdering::Release);
-            }
-        }
+        node.set_next(node);
 
-        gc.remove_root(node);
+        gc.remove_root_gc(node);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 0);
@@ -721,62 +814,108 @@ mod tests {
     fn test_partial_graph_collection() {
         let gc = AutoCollector::new(AutoCollectorConfig::default());
 
-        let root = gc.alloc(Node {
+        let root = gc.alloc_gc(Node {
             value: 0,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
 
-        let a = gc.alloc(Node {
+        let a = gc.alloc_gc(Node {
             value: 1,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
-        let b = gc.alloc(Node {
+        let b = gc.alloc_gc(Node {
             value: 2,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
-        let c = gc.alloc(Node {
+        let c = gc.alloc_gc(Node {
             value: 3,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
-        let d = gc.alloc(Node {
+        let d = gc.alloc_gc(Node {
             value: 4,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
-        let e = gc.alloc(Node {
+        let e = gc.alloc_gc(Node {
             value: 5,
-            next: Some(AtomicPtr::new(std::ptr::null_mut())),
+            next: AtomicAutoPtr::new(&gc),
         });
 
-        gc.remove_root(a);
-        gc.remove_root(b);
-        gc.remove_root(c);
-        gc.remove_root(d);
-        gc.remove_root(e);
+        gc.remove_root_gc(a);
+        gc.remove_root_gc(b);
+        gc.remove_root_gc(c);
+        gc.remove_root_gc(d);
+        gc.remove_root_gc(e);
 
-        unsafe {
-            if let Some(ref next_atomic) = (*root).next {
-                next_atomic.store(a, AtomicOrdering::Release);
-            }
-            if let Some(ref next_atomic) = (*a).next {
-                next_atomic.store(b, AtomicOrdering::Release);
-            }
-            if let Some(ref next_atomic) = (*b).next {
-                next_atomic.store(c, AtomicOrdering::Release);
-            }
-        }
+        root.set_next(a);
+        a.set_next(b);
+        b.set_next(c);
 
         assert_eq!(gc.allocation_count(), 6);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 4);
 
-        unsafe {
-            if let Some(ref next_atomic) = (*root).next {
-                next_atomic.store(std::ptr::null_mut(), AtomicOrdering::Release);
-            }
-        }
+        root.clear_next();
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 1);
     }
+
+    #[test]
+    fn incorrect() {
+        let gc = AutoCollector::new(AutoCollectorConfig::default());
+
+        let obj = gc.alloc_gc(Node {
+            value: 42,
+            next: AtomicAutoPtr::new(&gc),
+        });
+
+        let next_node = gc.alloc_gc(Node {
+            value: 179,
+            next: AtomicAutoPtr::new(&gc),
+        });
+
+        gc.remove_root_gc(next_node);
+        gc.manual_gc();
+
+        obj.set_next(next_node);
+
+        assert_eq!(gc.allocation_count(), 1);
+
+        let result = std::panic::catch_unwind(|| {
+            _ = obj
+                .next
+                .load(Ordering::Acquire)
+                .expect("should have next")
+                .value;
+        });
+
+        assert!(result.is_err());
+    }
+
+    // #[test]
+    // fn data_race() {
+    //     let gc = AutoCollector::new(AutoCollectorConfig::default());
+
+    //     let a = AtomicAutoPtr::new(&gc);
+    //     a.store(Some(gc.alloc_gc(3)), Ordering::Release);
+
+    //     thread::scope(|s| {
+    //         s.spawn(|| {
+    //             thread::sleep(Duration::from_millis(100));
+
+    //             let mut x = a.load(Ordering::Acquire).unwrap();
+    //             *x = 3;
+    //         });
+
+    //         s.spawn(|| {
+    //             thread::sleep(Duration::from_millis(100));
+
+    //             let mut x = a.load(Ordering::Acquire).unwrap();
+    //             *x = 4;
+    //         });
+    //     });
+
+    //     assert_eq!(*a.load(Ordering::Acquire).unwrap(), 3);
+    // }
 }

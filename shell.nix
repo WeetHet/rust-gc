@@ -2,20 +2,22 @@
   system ? builtins.currentSystem,
   pkgs ? import <nixpkgs> {
     inherit system;
-    overlays = [
-      (import (builtins.fetchTarball "https://github.com/oxalica/rust-overlay/archive/master.tar.gz"))
-    ];
+    overlays = [ (import <rust-overlay>) ];
   },
 }:
 pkgs.mkShell {
   packages = [
-    (pkgs.rust-bin.nightly.latest.default.override {
-      extensions = [
-        "rust-src"
-        "rust-analyzer"
-        "miri"
-      ];
-    })
+    (pkgs.rust-bin.selectLatestNightlyWith (
+      toolchain:
+      toolchain.default.override {
+        extensions = [
+          "rust-src"
+          "rust-analyzer"
+          "miri"
+        ];
+      }
+    ))
     pkgs.cargo-nextest
   ];
+  env.MIRIFLAGS = "-Zmiri-permissive-provenance";
 }

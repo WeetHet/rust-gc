@@ -1,92 +1,48 @@
-use rust_gc::{AutoCollector, AutoCollectorConfig, Traceable, Tracer};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use rust_gc::{AtomicAutoPtr, AutoCollector, AutoCollectorConfig, AutoPtr, Traceable, Tracer};
+use std::{ops::Deref, sync::atomic::Ordering};
 
 #[derive(Debug)]
 struct TreeNode {
     value: i32,
-    left: Option<AtomicPtr<TreeNode>>,
-    right: Option<AtomicPtr<TreeNode>>,
+    left: AtomicAutoPtr<TreeNode>,
+    right: AtomicAutoPtr<TreeNode>,
 }
-
-unsafe impl Send for TreeNode {}
-unsafe impl Sync for TreeNode {}
 
 impl Traceable for TreeNode {
     fn trace(&self, tracer: &mut Tracer) {
-        if let Some(ref left_atomic) = self.left {
-            let left_ptr = left_atomic.load(Ordering::Acquire);
-            if !left_ptr.is_null() {
-                tracer.edge(left_ptr as *const _);
-            }
+        if let Some(left_gc) = self.left.load(Ordering::Acquire) {
+            tracer.edge(left_gc.as_ptr() as *const ());
         }
-        if let Some(ref right_atomic) = self.right {
-            let right_ptr = right_atomic.load(Ordering::Acquire);
-            if !right_ptr.is_null() {
-                tracer.edge(right_ptr as *const _);
-            }
+        if let Some(right_gc) = self.right.load(Ordering::Acquire) {
+            tracer.edge(right_gc.as_ptr() as *const ());
         }
     }
 }
 
 impl TreeNode {
-    fn new(collector: &AutoCollector, value: i32) -> *mut TreeNode {
-        collector.alloc(TreeNode {
+    fn new(collector: &AutoCollector, value: i32) -> AutoPtr<TreeNode> {
+        collector.alloc_gc(TreeNode {
             value,
-            left: Some(AtomicPtr::new(std::ptr::null_mut())),
-            right: Some(AtomicPtr::new(std::ptr::null_mut())),
+            left: AtomicAutoPtr::new(collector),
+            right: AtomicAutoPtr::new(collector),
         })
     }
 
     fn insert(&self, collector: &AutoCollector, value: i32) {
         if value < self.value {
-            if let Some(ref left_atomic) = self.left {
-                let left_ptr = left_atomic.load(Ordering::Acquire);
-                if left_ptr.is_null() {
-                    let new_node = TreeNode::new(collector, value);
-                    collector.remove_root(new_node);
-                    left_atomic.store(new_node, Ordering::Release);
-                } else {
-                    unsafe {
-                        (*left_ptr).insert(collector, value);
-                    }
-                }
-            }
-        } else if let Some(ref right_atomic) = self.right {
-            let right_ptr = right_atomic.load(Ordering::Acquire);
-            if right_ptr.is_null() {
-                let new_node = TreeNode::new(collector, value);
-                collector.remove_root(new_node);
-                right_atomic.store(new_node, Ordering::Release);
+            if let Some(left) = self.left.load(Ordering::Acquire) {
+                left.insert(collector, value);
             } else {
-                unsafe {
-                    (*right_ptr).insert(collector, value);
-                }
+                let new_node = TreeNode::new(collector, value);
+                collector.remove_root_gc(new_node);
+                self.left.store(Some(new_node), Ordering::Release);
             }
-        }
-    }
-
-    fn print(&self, depth: usize) {
-        if let Some(ref right_atomic) = self.right {
-            let right_ptr = right_atomic.load(Ordering::Acquire);
-            if !right_ptr.is_null() {
-                unsafe {
-                    (*right_ptr).print(depth + 1);
-                }
-            }
-        }
-
-        for _ in 0..depth {
-            print!("  ");
-        }
-        println!("{}", self.value);
-
-        if let Some(ref left_atomic) = self.left {
-            let left_ptr = left_atomic.load(Ordering::Acquire);
-            if !left_ptr.is_null() {
-                unsafe {
-                    (*left_ptr).print(depth + 1);
-                }
-            }
+        } else if let Some(right) = self.right.load(Ordering::Acquire) {
+            right.insert(collector, value);
+        } else {
+            let new_node = TreeNode::new(collector, value);
+            collector.remove_root_gc(new_node);
+            self.right.store(Some(new_node), Ordering::Release);
         }
     }
 
@@ -94,68 +50,79 @@ impl TreeNode {
     fn count_nodes(&self) -> u32 {
         let mut count = 1;
 
-        if let Some(ref left_atomic) = self.left {
-            let left_ptr = left_atomic.load(Ordering::Acquire);
-            if !left_ptr.is_null() {
-                unsafe {
-                    count += (*left_ptr).count_nodes();
-                }
-            }
+        if let Some(left) = self.left.load(Ordering::Acquire) {
+            count += left.count_nodes();
         }
 
-        if let Some(ref right_atomic) = self.right {
-            let right_ptr = right_atomic.load(Ordering::Acquire);
-            if !right_ptr.is_null() {
-                unsafe {
-                    count += (*right_ptr).count_nodes();
-                }
-            }
+        if let Some(right) = self.right.load(Ordering::Acquire) {
+            count += right.count_nodes();
         }
 
         count
     }
 }
 
+impl From<&TreeNode> for Vec<i32> {
+    fn from(node: &TreeNode) -> Self {
+        let mut result = Vec::new();
+        node.inorder_traversal(&mut result);
+        result
+    }
+}
+
+impl TreeNode {
+    fn inorder_traversal(&self, result: &mut Vec<i32>) {
+        if let Some(left) = self.left.load(Ordering::Acquire) {
+            left.inorder_traversal(result);
+        }
+
+        result.push(self.value);
+
+        if let Some(right) = self.right.load(Ordering::Acquire) {
+            right.inorder_traversal(result);
+        }
+    }
+}
+
 fn main() {
-    println!("AutoCollector Binary Tree Demo");
-    println!("==============================\n");
-
     let collector = AutoCollector::new(AutoCollectorConfig::default());
-
-    println!("Creating binary search tree with automatic garbage collection...");
 
     let root = TreeNode::new(&collector, 50);
 
-    unsafe {
-        println!(
-            "Left: {:?}, Right: {:?}",
-            (*root).left.as_ref().map(|a| a.load(Ordering::Acquire)),
-            (*root).right.as_ref().map(|a| a.load(Ordering::Acquire))
-        );
-    }
+    println!(
+        "Left: {:?}, Right: {:?}",
+        root.left.load(Ordering::Acquire),
+        root.right.load(Ordering::Acquire)
+    );
 
     let values = [30, 70, 20, 40, 60, 80, 10, 25, 35, 45];
 
     for value in values {
-        unsafe {
-            (*root).insert(&collector, value);
-        }
+        root.insert(&collector, value);
     }
 
-    unsafe {
-        (*root).print(0);
-    }
+    println!(
+        "{}",
+        Vec::<i32>::from(root.deref())
+            .into_iter()
+            .map(|it| it.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
 
     println!("Allocated objects: {}", collector.allocation_count());
 
-    // Remove left subtree
-    unsafe {
-        if let Some(ref left_atomic) = (*root).left {
-            left_atomic.store(std::ptr::null_mut(), Ordering::Release);
-        }
-    }
-
+    root.left.clear(Ordering::Release);
     collector.manual_gc();
+
+    println!(
+        "{}",
+        Vec::<i32>::from(root.deref())
+            .into_iter()
+            .map(|it| it.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
 
     println!(
         "Allocated objects after removing left subtree: {}",
