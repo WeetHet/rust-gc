@@ -162,7 +162,6 @@ pub struct AutoCollector {
     roots: RwLock<HashMap<usize, ()>>,
     allocations: RwLock<HashMap<usize, TraceableObject>>,
     gray_objects: Mutex<VecDeque<usize>>,
-    gc_mutex: RwLock<()>,
     background_collector_thread: Mutex<Option<JoinHandle<()>>>,
     background_cv: Condvar,
     background_mutex: Mutex<()>,
@@ -208,7 +207,6 @@ impl AutoCollector {
             roots: RwLock::new(HashMap::new()),
             allocations: RwLock::new(HashMap::new()),
             gray_objects: Mutex::new(VecDeque::new()),
-            gc_mutex: RwLock::new(()),
             background_collector_thread: Mutex::new(None),
             background_cv: Condvar::new(),
             background_mutex: Mutex::new(()),
@@ -275,9 +273,9 @@ impl AutoCollector {
 
     fn reset_marks(&self) {
         if let Ok(mut allocations) = self.allocations.write() {
-            for (_, traceable_obj) in allocations.iter_mut() {
-                traceable_obj.color = Color::White;
-            }
+            allocations
+                .values_mut()
+                .for_each(|obj| obj.color = Color::White);
         }
     }
 
@@ -299,7 +297,6 @@ impl AutoCollector {
     }
 
     fn start_marking(&self) {
-        let _gc_lock = self.gc_mutex.write().unwrap();
         self.collecting.store(true, Ordering::SeqCst);
         self.reset_marks();
         self.mark_roots();
@@ -311,70 +308,55 @@ impl AutoCollector {
         }
 
         let objects_to_trace = {
-            if let Ok(mut gray_objects) = self.gray_objects.lock() {
-                let mut result = Vec::new();
-                let mut processed = 0;
-
-                while processed < self.steps_per_increment && !gray_objects.is_empty() {
-                    if let Some(current_addr) = gray_objects.pop_front() {
-                        result.push(current_addr);
-                        processed += 1;
-                    }
-                }
-                result
-            } else {
+            let Ok(mut gray_objects) = self.gray_objects.lock() else {
                 return;
-            }
+            };
+
+            (0..self.steps_per_increment)
+                .map_while(|_| gray_objects.pop_front())
+                .collect::<Vec<_>>()
         };
 
         for current_addr in objects_to_trace {
-            let trace_fn = {
-                if let Ok(mut allocations) = self.allocations.write() {
-                    if let Some(traceable_obj) = allocations.get_mut(&current_addr) {
-                        traceable_obj.color = Color::Black;
-                        traceable_obj.trace_fn
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
+            let Ok(mut allocations) = self.allocations.write() else {
+                continue;
             };
+
+            let Some(traceable_object) = allocations.get_mut(&current_addr) else {
+                continue;
+            };
+
+            traceable_object.color = Color::Black;
+            let trace_fn = traceable_object.trace_fn;
+
+            drop(allocations);
 
             let mut edges = Vec::new();
             let mut tracer = Tracer::new_edge_collector(&mut edges);
             trace_fn(with_exposed_provenance(current_addr), &mut tracer);
 
             for edge_addr in edges {
-                if let Ok(mut allocations) = self.allocations.write() {
-                    if let Some(traceable_obj) = allocations.get_mut(&edge_addr) {
-                        if traceable_obj.color == Color::White {
-                            traceable_obj.color = Color::Gray;
-                            drop(allocations);
+                if let Ok(mut allocations) = self.allocations.write()
+                    && let Some(traceable_obj) = allocations.get_mut(&edge_addr)
+                    && traceable_obj.color == Color::White
+                {
+                    traceable_obj.color = Color::Gray;
+                    drop(allocations);
 
-                            if let Ok(mut gray_objects) = self.gray_objects.lock() {
-                                gray_objects.push_back(edge_addr);
-                            }
-                        }
+                    if let Ok(mut gray_objects) = self.gray_objects.lock() {
+                        gray_objects.push_back(edge_addr);
                     }
                 }
             }
         }
 
-        let is_marking_done = {
-            if let Ok(gray_objects) = self.gray_objects.lock() {
-                gray_objects.is_empty()
-            } else {
-                false
-            }
-        };
+        let is_marking_done = self.gray_objects.lock().is_ok_and(|go| go.is_empty());
 
         if is_marking_done {
             if let Ok(mut allocations) = self.allocations.write() {
                 let white_addrs: Vec<usize> = allocations
                     .iter()
-                    .filter(|(_, obj)| obj.color == Color::White)
-                    .map(|(addr, _)| *addr)
+                    .filter_map(|(addr, obj)| (obj.color == Color::White).then_some(*addr))
                     .collect();
 
                 for addr in white_addrs {
@@ -383,9 +365,9 @@ impl AutoCollector {
                     }
                 }
 
-                for (_, traceable_obj) in allocations.iter_mut() {
-                    traceable_obj.color = Color::White;
-                }
+                allocations
+                    .values_mut()
+                    .for_each(|obj| obj.color = Color::White);
             }
 
             self.collecting.store(false, Ordering::SeqCst);
@@ -423,10 +405,10 @@ impl AutoCollector {
             self.background_cv.notify_one();
         }
 
-        if let Ok(mut thread_guard) = self.background_collector_thread.lock() {
-            if let Some(handle) = thread_guard.take() {
-                let _ = handle.join();
-            }
+        if let Ok(mut thread_guard) = self.background_collector_thread.lock()
+            && let Some(handle) = thread_guard.take()
+        {
+            let _ = handle.join();
         }
     }
 
@@ -468,11 +450,9 @@ impl AutoCollector {
     }
 
     pub fn allocation_count(&self) -> usize {
-        if let Ok(allocations) = self.allocations.read() {
-            allocations.len()
-        } else {
-            0
-        }
+        self.allocations
+            .read()
+            .map_or(0, |allocations| allocations.len())
     }
 }
 
@@ -483,9 +463,9 @@ impl Drop for AutoCollector {
         }
 
         if let Ok(mut allocations) = self.allocations.write() {
-            for (_, traceable_obj) in allocations.drain() {
-                (traceable_obj.destructor)();
-            }
+            allocations
+                .drain()
+                .for_each(|(_, traceable_obj)| (traceable_obj.destructor)());
         }
     }
 }
