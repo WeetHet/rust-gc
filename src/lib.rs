@@ -890,6 +890,8 @@ mod tests {
 
         assert_eq!(gc.allocation_count(), 1);
 
+        std::panic::set_hook(Box::new(|_| {}));
+
         let result = std::panic::catch_unwind(|| {
             _ = obj
                 .next
@@ -897,6 +899,9 @@ mod tests {
                 .expect("should have next")
                 .value;
         });
+
+        // unregister custom hook so any panic after this point functions normally
+        _ = std::panic::take_hook();
 
         assert!(result.is_err());
     }
