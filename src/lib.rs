@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
-use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -16,7 +16,7 @@ pub enum Color {
     Black,
 }
 
-pub trait Traceable: Send + Sync {
+pub trait Traceable: Send + Sync + Any {
     fn trace(&self, tracer: &mut Tracer);
 }
 
@@ -49,27 +49,40 @@ impl<T> Clone for AutoPtr<T> {
     }
 }
 
-impl<T: std::fmt::Debug> std::fmt::Debug for AutoPtr<T> {
+impl<T: std::fmt::Debug + 'static> std::fmt::Debug for AutoPtr<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.try_deref() {
+        self.with_try_deref(|val| match val {
             Some(val) => val.fmt(f),
             None => write!(f, "AutoPtr(freed)"),
-        }
+        })
     }
 }
 
-impl<T> AutoPtr<T> {
+impl<T: 'static> AutoPtr<T> {
     pub fn addr(self) -> usize {
         self.addr
     }
 
-    fn try_deref(&self) -> Option<&T> {
+    pub fn with_try_deref<R>(&self, f: impl FnOnce(Option<&T>) -> R) -> R {
         let collector = unsafe { &*self.collector };
 
-        let allocations = collector.allocations.read().ok()?;
-        let traceable_obj = allocations.get(&self.addr)?;
+        let allocations = collector
+            .allocations
+            .read()
+            .expect("allocations inaccessible: RWLock poisoned");
 
-        unsafe { Some(&*(traceable_obj.ptr as *const T)) }
+        let object = allocations
+            .get(&self.addr)
+            .and_then(|obj| (obj.data.as_ref() as &dyn Any).downcast_ref::<T>());
+
+        f(object)
+    }
+
+    pub fn with_deref<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        self.with_try_deref(|val| match val {
+            Some(val) => f(val),
+            None => panic!("AutoPtr is freed"),
+        })
     }
 }
 
@@ -79,7 +92,7 @@ pub struct AtomicAutoPtr<T> {
     _marker: PhantomData<T>,
 }
 
-impl<T> Traceable for AtomicAutoPtr<T> {
+impl<T: Any> Traceable for AtomicAutoPtr<T> {
     fn trace(&self, tracer: &mut Tracer) {
         if let Some(ptr) = self.load(Ordering::SeqCst) {
             tracer.edge(ptr.addr());
@@ -94,12 +107,10 @@ impl<T> std::fmt::Debug for AtomicAutoPtr<T> {
     }
 }
 
-// Safety: AtomicAutoPtr stores the collector as a usize address and uses AtomicUsize
-// for the inner pointer address. All operations are atomic and thread-safe.
 unsafe impl<T> Send for AtomicAutoPtr<T> {}
 unsafe impl<T> Sync for AtomicAutoPtr<T> {}
 
-impl<T> AtomicAutoPtr<T> {
+impl<T: 'static> AtomicAutoPtr<T> {
     pub fn new(collector: &AutoCollector) -> Self {
         Self {
             inner: AtomicUsize::new(0),
@@ -140,27 +151,17 @@ impl<T> AtomicAutoPtr<T> {
     }
 }
 
-impl<T> Deref for AutoPtr<T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        self.try_deref().expect(
-            "internal preconditions do not hold: allocation has been freed before dereferencing",
-        )
-    }
-}
-
 struct TraceableObject {
     color: Color,
-    ptr: *mut (),
-    trace_fn: fn(*const (), &mut Tracer),
-    destructor: Box<dyn Fn(*mut ()) + Send + Sync>,
+    data: Box<dyn Traceable>,
 }
 
 impl std::fmt::Debug for TraceableObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let addr = format!("{:p}", self.data.as_ref());
         f.debug_struct("TraceableObject")
-            .field("ptr", &self.ptr)
             .field("color", &self.color)
+            .field("addr", &addr)
             .finish()
     }
 }
@@ -176,9 +177,6 @@ pub struct AutoCollector {
     background_cv: Condvar,
     background_state: Mutex<bool>,
 }
-
-unsafe impl Send for AutoCollector {}
-unsafe impl Sync for AutoCollector {}
 
 pub struct AutoCollectorConfig {
     pub steps_per_increment: usize,
@@ -226,8 +224,19 @@ impl AutoCollector {
     }
 
     pub fn alloc<T: Traceable + 'static>(&self, value: T) -> AutoPtr<T> {
-        let ptr = self.create(value);
-        let addr = ptr as usize;
+        let boxed_value = Box::new(value);
+        let addr = (&raw const *boxed_value) as usize;
+
+        let traceable_obj = TraceableObject {
+            color: Color::Gray,
+            data: boxed_value,
+        };
+
+        self.add_root_raw(addr);
+
+        if let Ok(mut allocations) = self.allocations.write() {
+            allocations.insert(addr, traceable_obj);
+        }
 
         AutoPtr {
             addr,
@@ -244,37 +253,6 @@ impl AutoCollector {
     pub fn remove_root<T>(&self, handle: AutoPtr<T>) -> AutoPtr<T> {
         self.remove_root_raw(handle.addr);
         handle
-    }
-
-    pub fn create<T: Traceable + 'static>(&self, value: T) -> *mut T {
-        let boxed_value = Box::new(value);
-        let ptr = Box::into_raw(boxed_value);
-        let addr = ptr as usize;
-
-        let destructor = Box::new(move |ptr: *mut ()| unsafe {
-            let reconstructed_ptr = ptr as *mut T;
-            let _ = Box::from_raw(reconstructed_ptr);
-        }) as Box<dyn Fn(*mut ()) + Send + Sync>;
-
-        let trace_fn = |ptr: *const (), tracer: &mut Tracer| {
-            let typed_ptr = ptr as *const T;
-            unsafe { (*typed_ptr).trace(tracer) }
-        };
-
-        let traceable_obj = TraceableObject {
-            color: Color::Gray,
-            ptr: ptr as *mut (),
-            trace_fn,
-            destructor,
-        };
-
-        self.add_root_raw(addr);
-
-        if let Ok(mut allocations) = self.allocations.write() {
-            allocations.insert(addr, traceable_obj);
-        }
-
-        ptr
     }
 
     pub fn remove_root_raw(&self, addr: usize) {
@@ -345,14 +323,12 @@ impl AutoCollector {
             };
 
             traceable_object.color = Color::Black;
-            let trace_fn = traceable_object.trace_fn;
-            let ptr = traceable_object.ptr;
-
-            drop(allocations);
 
             let mut edges = Vec::new();
             let mut tracer = Tracer::new_edge_collector(&mut edges);
-            trace_fn(ptr as *const (), &mut tracer);
+            traceable_object.data.trace(&mut tracer);
+
+            drop(allocations);
 
             for edge_addr in edges {
                 if let Ok(mut allocations) = self.allocations.write()
@@ -379,9 +355,7 @@ impl AutoCollector {
                     .collect();
 
                 for addr in white_addrs {
-                    if let Some(traceable_obj) = allocations.remove(&addr) {
-                        (traceable_obj.destructor)(traceable_obj.ptr);
-                    }
+                    _ = allocations.remove(&addr);
                 }
 
                 allocations
@@ -483,12 +457,6 @@ impl Drop for AutoCollector {
         if self.is_running() {
             self.stop();
         }
-
-        if let Ok(mut allocations) = self.allocations.write() {
-            allocations
-                .drain()
-                .for_each(|(_, traceable_obj)| (traceable_obj.destructor)(traceable_obj.ptr));
-        }
     }
 }
 
@@ -504,7 +472,7 @@ macro_rules! impl_traceable_basic {
 
 impl_traceable_basic!(
     i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize, f32, f64, bool, char, String,
-    &str, AtomicU32
+    AtomicU32
 );
 
 impl<T: Send + Traceable> Traceable for Mutex<T> {
@@ -513,7 +481,7 @@ impl<T: Send + Traceable> Traceable for Mutex<T> {
     }
 }
 
-impl<T> Traceable for Vec<AtomicAutoPtr<T>> {
+impl<T: 'static> Traceable for Vec<AtomicAutoPtr<T>> {
     fn trace(&self, tracer: &mut Tracer) {
         for atomic_ptr in self {
             if let Some(ptr) = atomic_ptr.load(Ordering::SeqCst) {
@@ -585,7 +553,7 @@ mod tests {
             next: AtomicAutoPtr::new(&gc),
         });
 
-        parent.set_next(child);
+        parent.with_deref(|p| p.set_next(child));
 
         gc.remove_root(child);
 
@@ -618,13 +586,13 @@ mod tests {
             next: AtomicAutoPtr::new(&gc),
         });
 
-        parent.set_next(child);
+        parent.with_deref(|p| p.set_next(child));
 
         gc.remove_root(child);
 
         assert_eq!(gc.allocation_count(), 2);
 
-        parent.clear_next();
+        parent.with_deref(|p| p.clear_next());
 
         gc.manual_gc();
 
@@ -644,8 +612,8 @@ mod tests {
             next: AtomicAutoPtr::new(&gc),
         });
 
-        a.set_next(b);
-        b.set_next(a);
+        a.with_deref(|a_ref| a_ref.set_next(b));
+        b.with_deref(|b_ref| b_ref.set_next(a));
 
         gc.remove_root(a);
         gc.remove_root(b);
@@ -667,7 +635,7 @@ mod tests {
             next: AtomicAutoPtr::new(&gc),
         });
 
-        parent.set_next(child);
+        parent.with_deref(|p| p.set_next(child));
 
         gc.remove_root(parent);
         gc.remove_root(child);
@@ -692,7 +660,7 @@ mod tests {
             next: AtomicAutoPtr::new(&gc),
         });
 
-        a.set_next(b);
+        a.with_deref(|a_ref| a_ref.set_next(b));
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 2);
@@ -747,10 +715,10 @@ mod tests {
             next: AtomicAutoPtr::new(&gc),
         });
 
-        a.set_next(b);
-        b.set_next(c);
-        c.set_next(d);
-        d.set_next(a);
+        a.with_deref(|a_ref| a_ref.set_next(b));
+        b.with_deref(|b_ref| b_ref.set_next(c));
+        c.with_deref(|c_ref| c_ref.set_next(d));
+        d.with_deref(|d_ref| d_ref.set_next(a));
 
         let graph = gc.alloc(Graph {
             nodes: [a, b, c, d].map(AtomicAutoPtr::with_ptr),
@@ -785,7 +753,7 @@ mod tests {
                 .collect();
 
             for i in 0..objects.len() - 1 {
-                objects[i].set_next(objects[i + 1]);
+                objects[i].with_deref(|obj| obj.set_next(objects[i + 1]));
             }
 
             for &obj in &objects[1..] {
@@ -810,7 +778,7 @@ mod tests {
             next: AtomicAutoPtr::new(&gc),
         });
 
-        node.set_next(node);
+        node.with_deref(|n| n.set_next(node));
 
         gc.remove_root(node);
 
@@ -854,16 +822,16 @@ mod tests {
         gc.remove_root(d);
         gc.remove_root(e);
 
-        root.set_next(a);
-        a.set_next(b);
-        b.set_next(c);
+        root.with_deref(|r| r.set_next(a));
+        a.with_deref(|a_ref| a_ref.set_next(b));
+        b.with_deref(|b_ref| b_ref.set_next(c));
 
         assert_eq!(gc.allocation_count(), 6);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 4);
 
-        root.clear_next();
+        root.with_deref(|r| r.clear_next());
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 1);
@@ -886,18 +854,20 @@ mod tests {
         gc.remove_root(next_node);
         gc.manual_gc();
 
-        obj.set_next(next_node);
+        obj.with_deref(|o| o.set_next(next_node));
 
         assert_eq!(gc.allocation_count(), 1);
 
         std::panic::set_hook(Box::new(|_| {}));
 
         let result = std::panic::catch_unwind(|| {
-            _ = obj
-                .next
-                .load(Ordering::Acquire)
-                .expect("should have next")
-                .value;
+            obj.with_deref(|o| {
+                _ = o
+                    .next
+                    .load(Ordering::Acquire)
+                    .expect("should have next")
+                    .with_deref(|next| next.value);
+            });
         });
 
         // unregister custom hook so any panic after this point functions normally
@@ -918,18 +888,21 @@ mod tests {
                 thread::sleep(Duration::from_millis(10));
 
                 let x = a.load(Ordering::Acquire).unwrap();
-                x.store(3, Ordering::Release);
+                x.with_deref(|val| val.store(3, Ordering::Release));
             });
 
             s.spawn(|| {
                 thread::sleep(Duration::from_millis(10));
 
                 let x = a.load(Ordering::Acquire).unwrap();
-                x.store(4, Ordering::Release);
+                x.with_deref(|val| val.store(4, Ordering::Release));
             });
         });
 
-        let final_value = a.load(Ordering::Acquire).unwrap().load(Ordering::Acquire);
+        let final_value = a
+            .load(Ordering::Acquire)
+            .unwrap()
+            .with_deref(|val| val.load(Ordering::Acquire));
         assert!(final_value == 3 || final_value == 4);
     }
 
@@ -956,9 +929,7 @@ mod tests {
             roots
                 .load(Ordering::Acquire)
                 .unwrap()
-                .lock()
-                .unwrap()
-                .push(AtomicAutoPtr::with_ptr(vertex));
+                .with_deref(|r| r.lock().unwrap().push(AtomicAutoPtr::with_ptr(vertex)));
         };
 
         add_root(&roots, &last_vertex);
@@ -979,7 +950,7 @@ mod tests {
 
                             add_root(roots, &AtomicAutoPtr::with_ptr(new_node));
 
-                            new_node.set_next(current);
+                            new_node.with_deref(|n| n.set_next(current));
                             shared_ptr.store(Some(new_node), Ordering::Release);
 
                             gc.remove_root(new_node);
@@ -992,7 +963,7 @@ mod tests {
         });
 
         let final_node = last_vertex.load(Ordering::Acquire).unwrap();
-        assert!(final_node.value < 4000);
+        assert!(final_node.with_deref(|n| n.value) < 4000);
 
         last_vertex.clear(Ordering::Release);
         gc.remove_root(roots.load(Ordering::Acquire).unwrap());
