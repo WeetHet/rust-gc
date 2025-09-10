@@ -612,6 +612,10 @@ impl<T: 'static + Any + Send + Sync> Traceable for Vec<AtomicAutoPtr<T>> {
     }
 }
 
+impl Traceable for Vec<i32> {
+    fn trace(&self, _: &mut Tracer) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,5 +1091,18 @@ mod tests {
         gc.manual_gc();
 
         assert_eq!(gc.allocation_count(), 0);
+    }
+
+    #[test]
+    fn gc_during_deref() {
+        let gc = AutoCollector::new(AutoCollectorConfig::default());
+        let a = gc.alloc(vec![1]);
+        gc.remove_root(a);
+
+        a.with_deref(&gc, |a| {
+            gc.manual_gc();
+
+            assert_eq!(a[0], 1);
+        });
     }
 }
