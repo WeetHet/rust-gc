@@ -11,10 +11,10 @@ struct TreeNode {
 impl Traceable for TreeNode {
     fn trace(&self, tracer: &mut Tracer) {
         if let Some(left_gc) = self.left.load(Ordering::Acquire) {
-            tracer.edge(left_gc.addr());
+            tracer.edge(&left_gc);
         }
         if let Some(right_gc) = self.right.load(Ordering::Acquire) {
-            tracer.edge(right_gc.addr());
+            tracer.edge(&right_gc);
         }
     }
 }

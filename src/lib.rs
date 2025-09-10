@@ -25,9 +25,9 @@ pub struct Tracer<'a> {
 }
 
 impl<'a> Tracer<'a> {
-    pub fn edge(&mut self, addr: usize) {
+    pub fn edge<T>(&mut self, to: &AutoPtr<T>) {
         if let Some(edges) = &mut self.edges {
-            edges.push(addr);
+            edges.push(to.addr);
         }
     }
 
@@ -59,10 +59,6 @@ impl<T: std::fmt::Debug + 'static> std::fmt::Debug for AutoPtr<T> {
 }
 
 impl<T: 'static> AutoPtr<T> {
-    pub fn addr(self) -> usize {
-        self.addr
-    }
-
     pub fn with_try_deref<R>(&self, f: impl FnOnce(Option<&T>) -> R) -> R {
         let collector = unsafe { &*self.collector };
 
@@ -95,7 +91,7 @@ pub struct AtomicAutoPtr<T> {
 impl<T: Any> Traceable for AtomicAutoPtr<T> {
     fn trace(&self, tracer: &mut Tracer) {
         if let Some(ptr) = self.load(Ordering::SeqCst) {
-            tracer.edge(ptr.addr());
+            tracer.edge(&ptr);
         }
     }
 }
@@ -120,7 +116,7 @@ impl<T: 'static> AtomicAutoPtr<T> {
     }
 
     pub fn with_ptr(ptr: AutoPtr<T>) -> Self {
-        let addr = ptr.addr();
+        let addr = ptr.addr;
         Self {
             inner: AtomicUsize::new(addr),
             collector: ptr.collector,
@@ -142,7 +138,7 @@ impl<T: 'static> AtomicAutoPtr<T> {
     }
 
     pub fn store(&self, value: Option<AutoPtr<T>>, order: Ordering) {
-        let addr = value.map(|gc| gc.addr()).unwrap_or(0);
+        let addr = value.map(|gc| gc.addr).unwrap_or(0);
         self.inner.store(addr, order);
     }
 
@@ -167,6 +163,7 @@ impl std::fmt::Debug for TraceableObject {
 }
 
 pub struct AutoCollector {
+    id: u64,
     collecting: AtomicBool,
     background_collector_interval: u64,
     steps_per_increment: usize,
@@ -193,14 +190,14 @@ impl Default for AutoCollectorConfig {
 }
 
 impl AutoCollectorConfig {
-    fn with_steps_per_increment(self, steps_per_increment: usize) -> Self {
+    pub fn with_steps_per_increment(self, steps_per_increment: usize) -> Self {
         Self {
             steps_per_increment,
             ..self
         }
     }
 
-    fn with_background_collector_interval(self, background_collector_interval: u64) -> Self {
+    pub fn with_background_collector_interval(self, background_collector_interval: u64) -> Self {
         Self {
             background_collector_interval,
             ..self
@@ -211,6 +208,7 @@ impl AutoCollectorConfig {
 impl AutoCollector {
     pub fn new(config: AutoCollectorConfig) -> Arc<Self> {
         Arc::new(Self {
+            id: rand::random(),
             collecting: AtomicBool::new(false),
             background_collector_interval: config.background_collector_interval,
             steps_per_increment: config.steps_per_increment,
@@ -255,13 +253,13 @@ impl AutoCollector {
         handle
     }
 
-    pub fn remove_root_raw(&self, addr: usize) {
+    fn remove_root_raw(&self, addr: usize) {
         if let Ok(mut roots) = self.roots.write() {
             roots.remove(&addr);
         }
     }
 
-    pub fn add_root_raw(&self, addr: usize) {
+    fn add_root_raw(&self, addr: usize) {
         if let Ok(mut roots) = self.roots.write() {
             roots.insert(addr);
         }
@@ -491,7 +489,7 @@ impl<T: 'static> Traceable for Vec<AtomicAutoPtr<T>> {
     fn trace(&self, tracer: &mut Tracer) {
         for atomic_ptr in self {
             if let Some(ptr) = atomic_ptr.load(Ordering::SeqCst) {
-                tracer.edge(ptr.addr());
+                tracer.edge(&ptr);
             }
         }
     }
@@ -522,7 +520,7 @@ mod tests {
     impl Traceable for Node {
         fn trace(&self, tracer: &mut Tracer) {
             if let Some(next_gc) = self.next.load(Ordering::Acquire) {
-                tracer.edge(next_gc.addr());
+                tracer.edge(&next_gc);
             }
         }
     }
@@ -698,7 +696,7 @@ mod tests {
             fn trace(&self, tracer: &mut Tracer) {
                 for node in &self.nodes {
                     if let Some(node) = node.load(Ordering::SeqCst) {
-                        tracer.edge(node.addr());
+                        tracer.edge(&node);
                     }
                 }
             }

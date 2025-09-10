@@ -24,7 +24,7 @@ let ptr = collector.alloc(MyObject::new());
 impl Traceable for MyObject {
     fn trace(&self, tracer: &mut Tracer) {
         if let Some(ptr) = self.other_object.load(Ordering::SeqCst) {
-            tracer.edge(ptr.addr());
+            tracer.edge(&ptr);
         }
     }
 }
