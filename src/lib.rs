@@ -38,7 +38,7 @@ impl<'a> Tracer<'a> {
 
 pub struct AutoPtr<T> {
     addr: usize,
-    collector: *const AutoCollector,
+    collector_id: u64,
     _marker: PhantomData<T>,
 }
 
@@ -49,9 +49,14 @@ impl<T> Clone for AutoPtr<T> {
     }
 }
 
-impl<T: std::fmt::Debug + 'static> std::fmt::Debug for AutoPtr<T> {
+pub struct AutoPtrDebug<'a, T> {
+    ptr: AutoPtr<T>,
+    collector: &'a AutoCollector,
+}
+
+impl<'a, T: std::fmt::Debug + 'static> std::fmt::Debug for AutoPtrDebug<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.with_try_deref(|val| match val {
+        self.ptr.with_try_deref(self.collector, |val| match val {
             Some(val) => val.fmt(f),
             None => write!(f, "AutoPtr(freed)"),
         })
@@ -59,9 +64,11 @@ impl<T: std::fmt::Debug + 'static> std::fmt::Debug for AutoPtr<T> {
 }
 
 impl<T: 'static> AutoPtr<T> {
-    pub fn with_try_deref<R>(&self, f: impl FnOnce(Option<&T>) -> R) -> R {
-        let collector = unsafe { &*self.collector };
-
+    pub fn with_try_deref<R>(
+        &self,
+        collector: &AutoCollector,
+        f: impl FnOnce(Option<&T>) -> R,
+    ) -> R {
         let allocations = collector
             .allocations
             .read()
@@ -74,21 +81,28 @@ impl<T: 'static> AutoPtr<T> {
         f(object)
     }
 
-    pub fn with_deref<R>(&self, f: impl FnOnce(&T) -> R) -> R {
-        self.with_try_deref(|val| match val {
+    pub fn with_deref<R>(&self, collector: &AutoCollector, f: impl FnOnce(&T) -> R) -> R {
+        self.with_try_deref(collector, |val| match val {
             Some(val) => f(val),
             None => panic!("AutoPtr is freed"),
         })
     }
+
+    pub fn debug<'a>(&self, collector: &'a AutoCollector) -> AutoPtrDebug<'a, T> {
+        AutoPtrDebug {
+            ptr: *self,
+            collector,
+        }
+    }
 }
 
-pub struct AtomicAutoPtr<T> {
+pub struct AtomicAutoPtr<T: Send + Sync> {
     inner: AtomicUsize,
-    collector: *const AutoCollector,
+    collector_id: u64,
     _marker: PhantomData<T>,
 }
 
-impl<T: Any> Traceable for AtomicAutoPtr<T> {
+impl<T: Any + Send + Sync> Traceable for AtomicAutoPtr<T> {
     fn trace(&self, tracer: &mut Tracer) {
         if let Some(ptr) = self.load(Ordering::SeqCst) {
             tracer.edge(&ptr);
@@ -96,21 +110,18 @@ impl<T: Any> Traceable for AtomicAutoPtr<T> {
     }
 }
 
-impl<T> std::fmt::Debug for AtomicAutoPtr<T> {
+impl<T: Any + Send + Sync> std::fmt::Debug for AtomicAutoPtr<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let addr = self.inner.load(Ordering::Relaxed);
         write!(f, "AtomicAutoPtr({:#x})", addr)
     }
 }
 
-unsafe impl<T> Send for AtomicAutoPtr<T> {}
-unsafe impl<T> Sync for AtomicAutoPtr<T> {}
-
-impl<T: 'static> AtomicAutoPtr<T> {
+impl<T: 'static + Any + Send + Sync> AtomicAutoPtr<T> {
     pub fn new(collector: &AutoCollector) -> Self {
         Self {
             inner: AtomicUsize::new(0),
-            collector: collector as *const AutoCollector,
+            collector_id: collector.id,
             _marker: PhantomData,
         }
     }
@@ -119,7 +130,7 @@ impl<T: 'static> AtomicAutoPtr<T> {
         let addr = ptr.addr;
         Self {
             inner: AtomicUsize::new(addr),
-            collector: ptr.collector,
+            collector_id: ptr.collector_id,
             _marker: PhantomData,
         }
     }
@@ -131,7 +142,7 @@ impl<T: 'static> AtomicAutoPtr<T> {
         } else {
             Some(AutoPtr {
                 addr,
-                collector: self.collector,
+                collector_id: self.collector_id,
                 _marker: PhantomData,
             })
         }
@@ -238,7 +249,7 @@ impl AutoCollector {
 
         AutoPtr {
             addr,
-            collector: self as *const _,
+            collector_id: self.id,
             _marker: PhantomData,
         }
     }
@@ -485,7 +496,7 @@ impl<T: Send + Traceable> Traceable for Mutex<T> {
     }
 }
 
-impl<T: 'static> Traceable for Vec<AtomicAutoPtr<T>> {
+impl<T: 'static + Any + Send + Sync> Traceable for Vec<AtomicAutoPtr<T>> {
     fn trace(&self, tracer: &mut Tracer) {
         for atomic_ptr in self {
             if let Some(ptr) = atomic_ptr.load(Ordering::SeqCst) {
@@ -557,7 +568,7 @@ mod tests {
             next: AtomicAutoPtr::new(&gc),
         });
 
-        parent.with_deref(|p| p.set_next(child));
+        parent.with_deref(&gc, |p| p.set_next(child));
 
         gc.remove_root(child);
 
@@ -590,13 +601,13 @@ mod tests {
             next: AtomicAutoPtr::new(&gc),
         });
 
-        parent.with_deref(|p| p.set_next(child));
+        parent.with_deref(&gc, |p| p.set_next(child));
 
         gc.remove_root(child);
 
         assert_eq!(gc.allocation_count(), 2);
 
-        parent.with_deref(|p| p.clear_next());
+        parent.with_deref(&gc, |p| p.clear_next());
 
         gc.manual_gc();
 
@@ -616,8 +627,8 @@ mod tests {
             next: AtomicAutoPtr::new(&gc),
         });
 
-        a.with_deref(|a_ref| a_ref.set_next(b));
-        b.with_deref(|b_ref| b_ref.set_next(a));
+        a.with_deref(&gc, |a_ref| a_ref.set_next(b));
+        b.with_deref(&gc, |b_ref| b_ref.set_next(a));
 
         gc.remove_root(a);
         gc.remove_root(b);
@@ -639,7 +650,7 @@ mod tests {
             next: AtomicAutoPtr::new(&gc),
         });
 
-        parent.with_deref(|p| p.set_next(child));
+        parent.with_deref(&gc, |p| p.set_next(child));
 
         gc.remove_root(parent);
         gc.remove_root(child);
@@ -664,7 +675,7 @@ mod tests {
             next: AtomicAutoPtr::new(&gc),
         });
 
-        a.with_deref(|a_ref| a_ref.set_next(b));
+        a.with_deref(&gc, |a_ref| a_ref.set_next(b));
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 2);
@@ -719,10 +730,10 @@ mod tests {
             next: AtomicAutoPtr::new(&gc),
         });
 
-        a.with_deref(|a_ref| a_ref.set_next(b));
-        b.with_deref(|b_ref| b_ref.set_next(c));
-        c.with_deref(|c_ref| c_ref.set_next(d));
-        d.with_deref(|d_ref| d_ref.set_next(a));
+        a.with_deref(&gc, |a_ref| a_ref.set_next(b));
+        b.with_deref(&gc, |b_ref| b_ref.set_next(c));
+        c.with_deref(&gc, |c_ref| c_ref.set_next(d));
+        d.with_deref(&gc, |d_ref| d_ref.set_next(a));
 
         let graph = gc.alloc(Graph {
             nodes: [a, b, c, d].map(AtomicAutoPtr::with_ptr),
@@ -757,7 +768,7 @@ mod tests {
                 .collect();
 
             for i in 0..objects.len() - 1 {
-                objects[i].with_deref(|obj| obj.set_next(objects[i + 1]));
+                objects[i].with_deref(&gc, |obj| obj.set_next(objects[i + 1]));
             }
 
             for &obj in &objects[1..] {
@@ -782,7 +793,7 @@ mod tests {
             next: AtomicAutoPtr::new(&gc),
         });
 
-        node.with_deref(|n| n.set_next(node));
+        node.with_deref(&gc, |n| n.set_next(node));
 
         gc.remove_root(node);
 
@@ -826,16 +837,16 @@ mod tests {
         gc.remove_root(d);
         gc.remove_root(e);
 
-        root.with_deref(|r| r.set_next(a));
-        a.with_deref(|a_ref| a_ref.set_next(b));
-        b.with_deref(|b_ref| b_ref.set_next(c));
+        root.with_deref(&gc, |r| r.set_next(a));
+        a.with_deref(&gc, |a_ref| a_ref.set_next(b));
+        b.with_deref(&gc, |b_ref| b_ref.set_next(c));
 
         assert_eq!(gc.allocation_count(), 6);
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 4);
 
-        root.with_deref(|r| r.clear_next());
+        root.with_deref(&gc, |r| r.clear_next());
 
         gc.manual_gc();
         assert_eq!(gc.allocation_count(), 1);
@@ -858,26 +869,17 @@ mod tests {
         gc.remove_root(next_node);
         gc.manual_gc();
 
-        obj.with_deref(|o| o.set_next(next_node));
+        obj.with_deref(&gc, |o| o.set_next(next_node));
 
         assert_eq!(gc.allocation_count(), 1);
 
-        std::panic::set_hook(Box::new(|_| {}));
-
-        let result = std::panic::catch_unwind(|| {
-            obj.with_deref(|o| {
-                _ = o
-                    .next
-                    .load(Ordering::Acquire)
-                    .expect("should have next")
-                    .with_deref(|next| next.value);
-            });
+        obj.with_deref(&gc, |o| {
+            _ = o
+                .next
+                .load(Ordering::Acquire)
+                .expect("should have next")
+                .with_try_deref(&gc, |next| assert!(next.is_none()));
         });
-
-        // unregister custom hook so any panic after this point functions normally
-        _ = std::panic::take_hook();
-
-        assert!(result.is_err());
     }
 
     #[test]
@@ -892,21 +894,21 @@ mod tests {
                 thread::sleep(Duration::from_millis(10));
 
                 let x = a.load(Ordering::Acquire).unwrap();
-                x.with_deref(|val| val.store(3, Ordering::Release));
+                x.with_deref(&gc, |val| val.store(3, Ordering::Release));
             });
 
             s.spawn(|| {
                 thread::sleep(Duration::from_millis(10));
 
                 let x = a.load(Ordering::Acquire).unwrap();
-                x.with_deref(|val| val.store(4, Ordering::Release));
+                x.with_deref(&gc, |val| val.store(4, Ordering::Release));
             });
         });
 
         let final_value = a
             .load(Ordering::Acquire)
             .unwrap()
-            .with_deref(|val| val.load(Ordering::Acquire));
+            .with_deref(&gc, |val| val.load(Ordering::Acquire));
         assert!(final_value == 3 || final_value == 4);
     }
 
@@ -930,10 +932,9 @@ mod tests {
                 return;
             };
 
-            roots
-                .load(Ordering::Acquire)
-                .unwrap()
-                .with_deref(|r| r.lock().unwrap().push(AtomicAutoPtr::with_ptr(vertex)));
+            roots.load(Ordering::Acquire).unwrap().with_deref(&gc, |r| {
+                r.lock().unwrap().push(AtomicAutoPtr::with_ptr(vertex))
+            });
         };
 
         add_root(&roots, &last_vertex);
@@ -954,7 +955,7 @@ mod tests {
 
                             add_root(roots, &AtomicAutoPtr::with_ptr(new_node));
 
-                            new_node.with_deref(|n| n.set_next(current));
+                            new_node.with_deref(&gc, |n| n.set_next(current));
                             shared_ptr.store(Some(new_node), Ordering::Release);
 
                             gc.remove_root(new_node);
@@ -967,7 +968,7 @@ mod tests {
         });
 
         let final_node = last_vertex.load(Ordering::Acquire).unwrap();
-        assert!(final_node.with_deref(|n| n.value) < 4000);
+        assert!(final_node.with_deref(&gc, |n| n.value) < 4000);
 
         last_vertex.clear(Ordering::Release);
         gc.remove_root(roots.load(Ordering::Acquire).unwrap());

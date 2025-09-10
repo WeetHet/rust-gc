@@ -31,14 +31,14 @@ impl TreeNode {
     fn insert(&self, collector: &AutoCollector, value: i32) {
         if value < self.value {
             if let Some(left) = self.left.load(Ordering::Acquire) {
-                left.with_deref(|left| left.insert(collector, value));
+                left.with_deref(collector, |left| left.insert(collector, value));
             } else {
                 let new_node = TreeNode::new(collector, value);
                 collector.remove_root(new_node);
                 self.left.store(Some(new_node), Ordering::Release);
             }
         } else if let Some(right) = self.right.load(Ordering::Acquire) {
-            right.with_deref(|right| right.insert(collector, value));
+            right.with_deref(collector, |right| right.insert(collector, value));
         } else {
             let new_node = TreeNode::new(collector, value);
             collector.remove_root(new_node);
@@ -47,39 +47,37 @@ impl TreeNode {
     }
 
     #[allow(dead_code)]
-    fn count_nodes(&self) -> u32 {
+    fn count_nodes(&self, collector: &AutoCollector) -> u32 {
         let mut count = 1;
 
         if let Some(left) = self.left.load(Ordering::Acquire) {
-            left.with_try_deref(|left| count += left.map_or(0, |l| l.count_nodes()));
+            left.with_try_deref(collector, |left| {
+                count += left.map_or(0, |l| l.count_nodes(collector))
+            });
         }
 
         if let Some(right) = self.right.load(Ordering::Acquire) {
-            right.with_try_deref(|right| count += right.map_or(0, |r| r.count_nodes()));
+            right.with_try_deref(collector, |right| {
+                count += right.map_or(0, |r| r.count_nodes(collector))
+            });
         }
 
         count
     }
 }
 
-impl From<&TreeNode> for Vec<i32> {
-    fn from(node: &TreeNode) -> Self {
-        let mut result = Vec::new();
-        node.inorder_traversal(&mut result);
-        result
-    }
-}
-
 impl TreeNode {
-    fn inorder_traversal(&self, result: &mut Vec<i32>) {
+    fn inorder_traversal(&self, collector: &AutoCollector, result: &mut Vec<i32>) {
         if let Some(left) = self.left.load(Ordering::Acquire) {
-            left.with_deref(|left| left.inorder_traversal(result));
+            left.with_deref(collector, |left| left.inorder_traversal(collector, result));
         }
 
         result.push(self.value);
 
         if let Some(right) = self.right.load(Ordering::Acquire) {
-            right.with_deref(|right| right.inorder_traversal(result));
+            right.with_deref(collector, |right| {
+                right.inorder_traversal(collector, result)
+            });
         }
     }
 }
@@ -89,48 +87,56 @@ fn main() {
 
     let root = TreeNode::new(&collector, 50);
 
-    root.with_deref(|root| {
+    root.with_deref(&collector, |root| {
+        let (l, r) = (
+            root.left.load(Ordering::Acquire),
+            root.right.load(Ordering::Acquire),
+        );
         println!(
             "Left: {:?}, Right: {:?}",
-            root.left.load(Ordering::Acquire),
-            root.right.load(Ordering::Acquire)
+            l.map(|l| l.debug(&collector)),
+            r.map(|r| r.debug(&collector)),
         )
     });
 
     let values = [30, 70, 20, 40, 60, 80, 10, 25, 35, 45];
 
     for value in values {
-        root.with_deref(|root| root.insert(&collector, value));
+        root.with_deref(&collector, |root| root.insert(&collector, value));
     }
 
-    root.with_deref(|root| {
-        println!(
-            "{}",
-            Vec::<i32>::from(root)
-                .into_iter()
-                .map(|it| it.to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
+    let mut data = vec![];
+    root.with_deref(&collector, |root| {
+        root.inorder_traversal(&collector, &mut data);
     });
+
+    println!(
+        "{}",
+        data.iter()
+            .map(|it| it.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
 
     println!("Allocated objects: {}", collector.allocation_count());
 
-    root.with_deref(|root| {
+    root.with_deref(&collector, |root| {
         root.left.clear(Ordering::Release);
     });
     collector.manual_gc();
 
-    root.with_deref(|root| {
-        println!(
-            "{}",
-            Vec::<i32>::from(root)
-                .into_iter()
-                .map(|it| it.to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
+    data.clear();
+    root.with_deref(&collector, |root| {
+        root.right.clear(Ordering::Release);
     });
+
+    println!(
+        "{}",
+        data.iter()
+            .map(|it| it.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
 
     println!(
         "Allocated objects after removing left subtree: {}",
