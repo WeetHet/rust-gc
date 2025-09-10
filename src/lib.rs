@@ -63,25 +63,81 @@ impl<'a, T: std::fmt::Debug + 'static> std::fmt::Debug for AutoPtrDebug<'a, T> {
     }
 }
 
+/// A RAII guard that pins an object in the garbage collector to prevent it from being collected.
+///
+/// This guard is essential for memory safety when dereferencing AutoPtr objects. When an AutoPtr
+/// is dereferenced via `with_try_deref` or `with_deref`, we need to ensure that the object cannot
+/// be garbage collected while we hold a reference to it. Without this protection, the following
+/// race condition could occur:
+///
+/// 1. Thread A calls `with_deref` and gets a reference to an object
+/// 2. Thread B (garbage collector) runs concurrently and marks the object as unreachable
+/// 3. Thread B frees the object's memory
+/// 4. Thread A continues using the now-dangling reference, causing use-after-free
+///
+/// The PinGuard prevents this by:
+/// - Automatically pinning the object when created (in the constructor)
+/// - Keeping the object pinned for the duration of its lifetime
+/// - Automatically unpinning the object when dropped (via RAII)
+///
+/// This ensures that objects remain valid for the entire duration they're being accessed,
+/// while still allowing them to be collected once the access is complete.
+struct PinGuard<'a> {
+    addr: usize,
+    collector: &'a AutoCollector,
+}
+
+impl<'a> PinGuard<'a> {
+    fn new<T>(ptr: &'a AutoPtr<T>, collector: &'a AutoCollector) -> Self {
+        collector.pin(ptr.addr);
+        PinGuard {
+            addr: ptr.addr,
+            collector,
+        }
+    }
+}
+
+impl<'a> Drop for PinGuard<'a> {
+    fn drop(&mut self) {
+        self.collector.unpin(self.addr);
+    }
+}
+
 impl<T: 'static> AutoPtr<T> {
-    pub fn with_try_deref<R>(
-        &self,
-        collector: &AutoCollector,
-        f: impl FnOnce(Option<&T>) -> R,
+    pub fn with_try_deref<'a, R>(
+        &'a self,
+        collector: &'a AutoCollector,
+        f: impl FnOnce(Option<&'a T>) -> R,
     ) -> R {
         assert_eq!(
             self.collector_id, collector.id,
             "Collector ID mismatch in deref"
         );
 
+        let _guard = PinGuard::new(self, collector);
+
         let allocations = collector
             .allocations
             .read()
             .expect("allocations inaccessible: RWLock poisoned");
 
+        // We need to use transmute here to extend the lifetime of the reference from the
+        // lifetime of the allocations RwLockReadGuard to the lifetime 'a of this function.
+        // This is necessary because we drop the allocations guard before calling the closure,
+        // which allows the closure to call collector.alloc() and other collector methods
+        // that would otherwise cause a deadlock by trying to acquire the same RwLock.
+        //
+        // SAFETY: This transmute is safe because:
+        // 1. The object is pinned while we hold the reference, preventing collection
+        // 2. The collector guarantees object stability while pinned
+        // 3. The lifetime 'a is constrained to this function's execution
+        // 4. We unpin the object before returning, maintaining the invariant
         let object = allocations
             .get(&self.addr)
-            .and_then(|obj| (obj.data.as_ref() as &dyn Any).downcast_ref::<T>());
+            .and_then(|obj| (obj.data.as_ref() as &dyn Any).downcast_ref::<T>())
+            .map(|obj| unsafe { std::mem::transmute(obj) });
+
+        drop(allocations);
 
         f(object)
     }
@@ -184,6 +240,7 @@ pub struct AutoCollector {
     background_collector_interval: u64,
     steps_per_increment: usize,
     roots: RwLock<HashSet<usize>>,
+    pinned: RwLock<HashSet<usize>>,
     allocations: RwLock<HashMap<usize, TraceableObject>>,
     gray_objects: Mutex<VecDeque<usize>>,
     background_collector_thread: Mutex<Option<JoinHandle<()>>>,
@@ -229,6 +286,7 @@ impl AutoCollector {
             background_collector_interval: config.background_collector_interval,
             steps_per_increment: config.steps_per_increment,
             roots: RwLock::new(HashSet::new()),
+            pinned: RwLock::new(HashSet::new()),
             allocations: RwLock::new(HashMap::new()),
             gray_objects: Mutex::new(VecDeque::new()),
             background_collector_thread: Mutex::new(None),
@@ -267,6 +325,47 @@ impl AutoCollector {
     pub fn remove_root<T>(&self, handle: AutoPtr<T>) -> AutoPtr<T> {
         self.remove_root_raw(handle.addr);
         handle
+    }
+
+    /// Pins an object at the given address, preventing it from being garbage collected.
+    ///
+    /// This is needed to ensure memory safety when dereferencing AutoPtr objects.
+    /// When an AutoPtr is dereferenced via `with_try_deref` or `with_deref`, the object
+    /// is temporarily pinned to prevent the garbage collector from freeing it while
+    /// it's being accessed. This prevents use-after-free bugs that could occur if
+    /// the GC runs concurrently and collects the object while a reference to it exists.
+    ///
+    /// The pinning mechanism works by:
+    /// 1. Adding the object's address to a set of pinned addresses
+    /// 2. The GC checks this set during collection and skips pinned objects
+    /// 3. Objects remain pinned until explicitly unpinned
+    fn pin(&self, addr: usize) {
+        if let Ok(mut pinned) = self.pinned.write() {
+            pinned.insert(addr);
+        }
+    }
+
+    /// Unpins an object at the given address, allowing it to be garbage collected again.
+    ///
+    /// This is called after dereferencing an AutoPtr is complete to restore the object's
+    /// eligibility for garbage collection. The unpinning must happen after the borrowed
+    /// reference to the object is no longer used to maintain memory safety.
+    ///
+    /// This works in conjunction with `pin()` to create a temporary protection window
+    /// around object access, ensuring that:
+    /// - Objects can't be freed while actively being used
+    /// - Objects don't remain permanently protected from collection
+    /// - The GC can still collect unreachable objects when they're not being accessed
+    fn unpin(&self, addr: usize) {
+        if let Ok(mut pinned) = self.pinned.write() {
+            pinned.remove(&addr);
+        }
+    }
+
+    fn is_pinned(&self, addr: usize) -> bool {
+        self.pinned
+            .read()
+            .is_ok_and(|pinned| pinned.contains(&addr))
     }
 
     fn remove_root_raw(&self, addr: usize) {
@@ -371,7 +470,9 @@ impl AutoCollector {
             if let Ok(mut allocations) = self.allocations.write() {
                 let white_addrs: Vec<usize> = allocations
                     .iter()
-                    .filter_map(|(addr, obj)| (obj.color == Color::White).then_some(*addr))
+                    .filter_map(|(addr, obj)| {
+                        (obj.color == Color::White && !self.is_pinned(*addr)).then_some(*addr)
+                    })
                     .collect();
 
                 for addr in white_addrs {

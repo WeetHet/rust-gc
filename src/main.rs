@@ -28,6 +28,7 @@ impl TreeNode {
         })
     }
 
+    #[allow(clippy::collapsible_else_if)]
     fn insert(&self, collector: &AutoCollector, value: i32) {
         if value < self.value {
             if let Some(left) = self.left.load(Ordering::Acquire) {
@@ -37,12 +38,14 @@ impl TreeNode {
                 collector.remove_root(new_node);
                 self.left.store(Some(new_node), Ordering::Release);
             }
-        } else if let Some(right) = self.right.load(Ordering::Acquire) {
-            right.with_deref(collector, |right| right.insert(collector, value));
         } else {
-            let new_node = TreeNode::new(collector, value);
-            collector.remove_root(new_node);
-            self.right.store(Some(new_node), Ordering::Release);
+            if let Some(right) = self.right.load(Ordering::Acquire) {
+                right.with_deref(collector, |right| right.insert(collector, value));
+            } else {
+                let new_node = TreeNode::new(collector, value);
+                collector.remove_root(new_node);
+                self.right.store(Some(new_node), Ordering::Release);
+            }
         }
     }
 
@@ -127,7 +130,7 @@ fn main() {
 
     data.clear();
     root.with_deref(&collector, |root| {
-        root.right.clear(Ordering::Release);
+        root.inorder_traversal(&collector, &mut data);
     });
 
     println!(
