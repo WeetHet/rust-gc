@@ -69,6 +69,11 @@ impl<T: 'static> AutoPtr<T> {
         collector: &AutoCollector,
         f: impl FnOnce(Option<&T>) -> R,
     ) -> R {
+        assert_eq!(
+            self.collector_id, collector.id,
+            "Collector ID mismatch in deref"
+        );
+
         let allocations = collector
             .allocations
             .read()
