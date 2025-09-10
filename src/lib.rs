@@ -265,6 +265,12 @@ impl AutoCollector {
         if let Ok(mut roots) = self.roots.write() {
             roots.insert(addr);
         }
+
+        if let Ok(mut allocations) = self.allocations.write()
+            && let Some(traceable_obj) = allocations.get_mut(&addr)
+        {
+            traceable_obj.color = Color::Gray;
+        }
     }
 
     fn reset_marks(&self) {
