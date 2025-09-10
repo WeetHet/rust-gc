@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -39,7 +39,7 @@ impl<'a> Tracer<'a> {
 pub struct AutoPtr<T> {
     addr: usize,
     collector_id: u64,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<*const T>,
 }
 
 impl<T> Copy for AutoPtr<T> {}
@@ -104,7 +104,7 @@ impl<T: 'static> AutoPtr<T> {
 pub struct AtomicAutoPtr<T: Send + Sync> {
     inner: AtomicUsize,
     collector_id: u64,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<AtomicPtr<T>>,
 }
 
 impl<T: Any + Send + Sync> Traceable for AtomicAutoPtr<T> {
